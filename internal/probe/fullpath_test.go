@@ -120,7 +120,7 @@ func (s *fakeSOCKS) serve(c net.Conn) {
 	pb := make([]byte, 2)
 	io.ReadFull(r, pb)
 	s.targets.Store(fmt.Sprintf("%s:%d", host, int(pb[0])<<8|int(pb[1])), true)
-	c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+	c.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0x9c, 0x40})
 	session := int(s.sessions.Add(1))
 	s.node(session, &bufferedConn{Conn: c, r: r})
 }
@@ -288,7 +288,7 @@ func TestFullPathWrongCredentials(t *testing.T) {
 	p := s.proxy()
 	p.Password = "wrong"
 	r := FullPathLatency(p, testGame, testPort, fastOpts())
-	if r.SuccessCount != 0 || r.Errors[0] != "本地 SOCKS5 认证失败" {
+	if r.SuccessCount != 0 || r.Errors[0] != "SOCKS5 认证失败" {
 		t.Fatalf("result = %+v", r)
 	}
 	if got := s.sessions.Load(); got != 0 {

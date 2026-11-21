@@ -6,23 +6,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/probe"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
-	"github.com/mozziexwz/node_launcher/internal/store"
-	"github.com/mozziexwz/node_launcher/internal/sysproxy"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/probe"
+	"github.com/mozziexwz/gameboost/internal/sysproxy"
 )
 
-// Taking over the game's connections to the Windows system proxy. Apps such
-// as v2rayN and the Clash family point the system proxy at a local port; the
-// game's launcher follows it, so its region check would leave through their
-// node. A redirector rule diverts those connections to sysproxy.Server, which
-// answers in the proxy's place and sends the real requests through MSBOOST.
+// A redirector rule diverts selected apps' system-proxy connections to
+// sysproxy.Server. It answers the system proxy protocol locally and sends
+// the requests through the configured GAMEBOOST proxy.
 //
-// The rule is added before the game rule because rules match in order, and is
-// edited in place (never re-added) when the system proxy or the addons change.
-
-const systemProxyRuleKey = "sysproxy"
+// The rule comes before the process rule and is edited in place when the
+// system proxy changes.
 
 // systemProxyRefresh is how often a running session re-reads the system proxy.
 var systemProxyRefresh = 5 * time.Second
@@ -36,17 +30,6 @@ type proxyTakeover struct {
 	done      chan struct{}
 }
 
-// proxiedProcesses lists the game's and the enabled addons' processes.
-func proxiedProcesses(s store.Settings) string {
-	list := []string{profiles.DefaultMapleStory().ProcessList()}
-	for _, a := range profiles.Addons() {
-		if s.Addons[a.ID] {
-			list = append(list, a.ProcessList())
-		}
-	}
-	return strings.Join(list, ";")
-}
-
 // ruleTargets returns the rule's hosts and ports; with no endpoints the rule
 // keeps its place but is disabled.
 func ruleTargets(eps []sysproxy.Endpoint) (hosts, ports string, enabled bool) {
@@ -57,17 +40,13 @@ func ruleTargets(eps []sysproxy.Endpoint) (hosts, ports string, enabled bool) {
 	return hosts, ports, true
 }
 
-// engineDialer dials through the session's core: a SOCKS5 CONNECT with the
-// session credentials, so domain names are resolved on the node.
-func engineDialer(eng CoreEngine) sysproxy.DialFunc {
-	user, password := eng.Credential()
-	p := probe.Proxy{Addr: eng.Addr().String(), User: user, Password: password}
+func proxyDialer(p probe.Proxy) sysproxy.DialFunc {
 	return func(ctx context.Context, host string, port int) (net.Conn, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			deadline = time.Now().Add(15 * time.Second)
 		}
-		conn, err := probe.DialSOCKS5(p, host, port, deadline)
+		conn, err := probe.DialSOCKS5Context(ctx, p, host, port, deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -78,8 +57,8 @@ func engineDialer(eng CoreEngine) sysproxy.DialFunc {
 
 // startTakeover starts the stand-in proxy and adds its rule; it must run
 // before the game rule is added. Everything it creates is registered in undo.
-func (c *Controller) startTakeover(red Redirector, eng CoreEngine, processes string, undo *[]func(), secrets *[]string) (*proxyTakeover, error) {
-	server, err := sysproxy.NewServer(engineDialer(eng), func(format string, args ...any) {
+func (c *Controller) startTakeover(red Redirector, upstream probe.Proxy, processes string, undo *[]func(), secrets *[]string) (*proxyTakeover, error) {
+	server, err := sysproxy.NewServer(proxyDialer(upstream), func(format string, args ...any) {
 		c.log.Printf(logx.App, format, args...)
 	})
 	if err != nil {
@@ -119,7 +98,7 @@ func (c *Controller) startTakeover(red Redirector, eng CoreEngine, processes str
 func (c *Controller) setLoopbackPorts(red Redirector, eps []sysproxy.Endpoint) {
 	ports := sysproxy.LoopbackPorts(eps)
 	if err := red.SetLocalhostProxyPorts(ports); err != nil && len(ports) > 0 {
-		c.log.Printf(logx.App, "%v；游戏发往本机系统代理的请求仍会经由其他代理软件", err)
+		c.log.Printf(logx.App, "%v。发往本机系统代理的请求仍会经由其他代理软件", err)
 	}
 }
 
@@ -130,7 +109,7 @@ func (c *Controller) logEndpoints(eps []sysproxy.Endpoint, starting bool) {
 		for _, e := range eps {
 			names = append(names, e.String())
 		}
-		c.log.Printf(logx.App, "检测到系统代理 %s，游戏发往它的请求将由 MSBOOST 接管", strings.Join(names, "、"))
+		c.log.Printf(logx.App, "检测到系统代理 %s，加速进程发往它的请求将由 GAMEBOOST 接管", strings.Join(names, "、"))
 	case !starting:
 		c.log.Printf(logx.App, "系统代理已关闭")
 	}
@@ -155,7 +134,8 @@ func (c *Controller) watchSystemProxy(t *proxyTakeover) {
 			c.mu.Lock()
 			if c.state == StateRunning && c.session != nil && c.session.takeover == t && !sysproxy.Equal(eps, t.endpoints) {
 				t.endpoints = eps
-				c.updateTakeoverLocked(t, proxiedProcesses(c.settings))
+				programs, _ := c.settings.RouteRule()
+				c.updateTakeoverLocked(t, programs)
 				c.setLoopbackPorts(c.red, eps)
 				c.logEndpoints(eps, false)
 			}

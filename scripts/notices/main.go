@@ -1,6 +1,6 @@
 // Command notices writes THIRD_PARTY_NOTICES.txt for the release zip: the
 // copyright and license texts of everything compiled into
-// MSBOOST-Launcher.exe. Run it from the repository root after
+// GAMEBOOST.exe. Run it from the repository root after
 // fetch-windivert.ps1 and the frontend install:
 //
 //	go run ./scripts/notices -o build/release/THIRD_PARTY_NOTICES.txt
@@ -224,11 +224,11 @@ func render(comps []component, gpl string) (string, error) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("MSBOOST 启动器 — 第三方软件声明 / Third-party notices\n")
+	sb.WriteString("GAMEBOOST 第三方软件声明 / Third-party notices\n")
 	sb.WriteString(strings.Repeat("=", 78) + "\n\n")
-	sb.WriteString("MSBOOST 启动器依据 GNU 通用公共许可证第 3 版（GPL-3.0）发布，许可全文见 LICENSE.txt。\n")
+	sb.WriteString("GAMEBOOST 依据 GNU 通用公共许可证第 3 版（GPL-3.0）发布，许可全文见 LICENSE.txt。\n")
 	sb.WriteString("本程序包含以下第三方软件，它们的版权声明与许可文本附在后面。\n\n")
-	sb.WriteString("MSBOOST Launcher is licensed under the GNU General Public License v3.0 (LICENSE.txt).\n")
+	sb.WriteString("GAMEBOOST is licensed under the GNU General Public License v3.0 (LICENSE.txt).\n")
 	sb.WriteString("It includes the third-party software listed below; their notices follow.\n\n")
 	sb.WriteString(summary.String())
 	for _, b := range blocks {

@@ -6,8 +6,12 @@
 package engine
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/enfein/mieru/v3/pkg/appctl"
 	"github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
@@ -44,6 +48,10 @@ func LoadConfigFile(path string) (*Config, error) {
 // httpProxyPort, rpcPort) are still validated but ignored at runtime.
 func ParseConfig(b []byte) (*Config, error) {
 	client := &appctlpb.ClientConfig{}
+	b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
+	if !json.Valid(b) {
+		return nil, errors.New("节点配置 JSON 格式无效")
+	}
 	if err := common.UnmarshalJSON(b, client); err != nil {
 		return nil, fmt.Errorf("不是有效的 MSBOOST 节点配置：%w", err)
 	}
@@ -55,6 +63,32 @@ func ParseConfig(b []byte) (*Config, error) {
 		return nil, fmt.Errorf("找不到当前使用的配置方案：%w", err)
 	}
 	return &Config{Client: client, Profile: profile}, nil
+}
+
+// ParseConfigLink uses mieru's importer without modifying its own global
+// config directory. Links can contain passwords, so parser errors stay local.
+func ParseConfigLink(link string) (*Config, []byte, error) {
+	link = strings.TrimSpace(link)
+	if !strings.HasPrefix(link, "mierus://") {
+		return nil, nil, errors.New("请粘贴以 mierus:// 开头的节点链接")
+	}
+	client, err := appctl.ParseURLClientConfig(link)
+	if err != nil || len(client.GetProfiles()) != 1 {
+		return nil, nil, errors.New("节点链接无效，请检查用户名、密码、主机、端口和协议")
+	}
+	client.ActiveProfile = proto.String(client.GetProfiles()[0].GetProfileName())
+	// The launcher ignores the file's SOCKS port and creates a random
+	// authenticated loopback listener. The JSON schema requires a valid port.
+	client.Socks5Port = proto.Int32(1080)
+	b, err := common.MarshalJSON(client)
+	if err != nil {
+		return nil, nil, errors.New("无法生成节点配置")
+	}
+	cfg, err := ParseConfig(b)
+	if err != nil {
+		return nil, nil, errors.New("节点链接校验失败")
+	}
+	return cfg, append(b, '\n'), nil
 }
 
 // Transports reports which transports the active profile has bindings for.

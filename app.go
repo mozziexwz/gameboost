@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -15,15 +14,16 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
-	"github.com/mozziexwz/node_launcher/internal/app"
-	"github.com/mozziexwz/node_launcher/internal/engine"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/redirector"
-	"github.com/mozziexwz/node_launcher/internal/store"
-	"github.com/mozziexwz/node_launcher/internal/winsys"
+	"github.com/mozziexwz/gameboost/internal/app"
+	"github.com/mozziexwz/gameboost/internal/engine"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/redirector"
+	"github.com/mozziexwz/gameboost/internal/store"
+	"github.com/mozziexwz/gameboost/internal/winsys"
 )
 
 // coreInstance is shared with msboostctl so only one program drives the core.
+// Share the core lock with node_launcher, since both reserve the relay ports.
 const coreInstance = "MSBOOST-Launcher-Core"
 
 // App is bound to the frontend; its exported methods are the UI's API.
@@ -56,7 +56,7 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.releaseLock, a.lockErr = winsys.AcquireInstance(coreInstance)
 	if a.lockErr != nil {
-		a.log.Printf(logx.App, "核心正被另一个 MSBOOST 程序使用（例如 msboostctl），本窗口暂不能开始加速")
+		a.log.Printf(logx.App, "分流核心正在被另一个程序使用，本窗口暂不能开始加速")
 	}
 	a.tray = startTray(trayIcons{idle: trayIdleIcon, running: trayRunningIcon},
 		trayActions{show: a.ShowWindow, toggle: a.toggleFromTray, quit: a.quitFromTray})
@@ -69,7 +69,8 @@ func (a *App) startup(ctx context.Context) {
 	a.stopBg = cancel
 	go a.pushStatus(bg)
 	go a.pushLogs(bg)
-	a.log.Printf(logx.App, "MSBOOST 启动器已启动，版本 %s，数据目录 %s", versionString(), a.layout.Root)
+	a.log.Printf(logx.App, "GAMEBOOST 已启动，版本 %s，数据目录 %s", versionString(), a.layout.Root)
+	a.log.Printf(logx.App, "管理员权限：%v", winsys.IsElevated())
 	a.log.Printf(logx.App, "分流组件：%s", a.runtime.describe)
 }
 
@@ -132,7 +133,7 @@ func (a *App) shutdown(context.Context) {
 	if a.releaseLock != nil {
 		a.releaseLock()
 	}
-	a.log.Printf(logx.App, "MSBOOST 启动器已退出")
+	a.log.Printf(logx.App, "GAMEBOOST 已退出")
 	a.log.Close()
 }
 
@@ -145,9 +146,15 @@ func (a *App) onSecondInstance(options.SecondInstanceData) {
 func (a *App) toggleFromTray() {
 	switch a.ctl.Status().State {
 	case app.StateRunning:
-		if running := a.ctl.RunningGameProcesses(); len(running) > 0 && !a.confirm("停止加速",
-			"MapleStory 正在运行，停止加速会断开游戏连接。确定停止吗？") {
-			return
+		running := a.ctl.RunningProcesses()
+		if a.ctl.Settings().Mode == store.ModeIP || len(running) > 0 {
+			message := "停止加速会断开代理连接。确定停止吗？"
+			if len(running) > 0 {
+				message = "正在运行 " + strings.Join(running, "、") + "。" + message
+			}
+			if !a.confirm("停止加速", message) {
+				return
+			}
 		}
 		if err := a.Stop(); err != nil {
 			a.notify("error", "停止加速失败："+err.Error())
@@ -164,7 +171,7 @@ func (a *App) toggleFromTray() {
 }
 
 func (a *App) quitFromTray() {
-	if a.ctl.Status().State != app.StateIdle && !a.confirm("退出", "正在加速，退出会停止加速并断开游戏连接。确定退出吗？") {
+	if a.ctl.Status().State != app.StateIdle && !a.confirm("退出", "退出会停止加速并断开代理连接。确定退出吗？") {
 		return
 	}
 	a.Quit()
@@ -198,24 +205,25 @@ func (a *App) Overview() OverviewDTO {
 	list, _ := a.layout.ListConfigs()
 	elevated, conflicts := a.ctl.Preflight()
 	dto := OverviewDTO{
-		Status:        toStatusDTO(a.ctl.Status()),
-		Configs:       toConfigDTOs(list, settings.CurrentConfig),
-		Addons:        toAddonDTOs(settings.Addons),
-		GameGroups:    toGroupDTOs(),
-		ProbeAddress:  settings.ProbeTarget.Address,
-		ProbePort:     settings.ProbeTarget.Port,
-		Transport:     engine.TransportTCP,
-		Elevated:      elevated,
-		Conflicts:     toConflictDTOs(conflicts),
-		SettingsError: a.settingsErr,
-		DataDir:       a.layout.Root,
-		Version:       versionString(),
+		Status:         toStatusDTO(a.ctl.Status()),
+		Configs:        toConfigDTOs(list, settings.CurrentConfig),
+		Mode:           string(settings.Mode),
+		Processes:      settings.Processes,
+		ProcessFolders: settings.ProcessFolders,
+		Targets:        settings.Targets,
+		ExitTarget:     app.ExitTargetURL,
+		Transport:      engine.TransportTCP,
+		Elevated:       elevated,
+		Conflicts:      toConflictDTOs(conflicts),
+		SettingsError:  a.settingsErr,
+		DataDir:        a.layout.Root,
+		Version:        versionString(),
 	}
 	if settings.Transport == engine.TransportUDP {
 		dto.Transport = engine.TransportUDP
 	}
 	if a.lockErr != nil {
-		dto.LockError = "另一个 MSBOOST 程序（例如 msboostctl）正在使用加速核心，请先关闭它，然后重新打开本程序"
+		dto.LockError = "另一个程序正在使用分流核心，请关闭该程序后重新打开 GAMEBOOST"
 	}
 	return dto
 }
@@ -223,7 +231,7 @@ func (a *App) Overview() OverviewDTO {
 // Start begins acceleration and returns non-fatal warnings.
 func (a *App) Start() ([]string, error) {
 	if a.lockErr != nil {
-		return nil, errors.New("另一个 MSBOOST 程序正在使用加速核心，请先关闭它")
+		return nil, errors.New("另一个程序正在使用分流核心，请先关闭该程序")
 	}
 	return a.ctl.Start()
 }
@@ -231,17 +239,59 @@ func (a *App) Start() ([]string, error) {
 // Stop ends acceleration.
 func (a *App) Stop() error { return a.ctl.Stop() }
 
-// RunningGameProcesses lists running game processes (to confirm a stop).
-func (a *App) RunningGameProcesses() []string { return a.ctl.RunningGameProcesses() }
+// RunningProcesses lists running acceleration targets for the stop confirmation.
+func (a *App) RunningProcesses() []string { return a.ctl.RunningProcesses() }
 
 // SelectConfig makes a file in configs\ the current node configuration.
 func (a *App) SelectConfig(name string) error { return a.ctl.SelectConfig(name) }
 
+func (a *App) SetMode(mode string) error {
+	return a.ctl.SetMode(store.RouteMode(mode))
+}
+
+func (a *App) SetTargets(targets []string) ([]string, error) {
+	if err := a.ctl.SetTargets(targets); err != nil {
+		return nil, err
+	}
+	return a.ctl.Settings().Targets, nil
+}
+
+// PickProcessFiles asks for Windows executables to add to the process list.
+func (a *App) PickProcessFiles() ([]string, error) {
+	return runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:   "选择要加速的程序",
+		Filters: []runtime.FileFilter{{DisplayName: "可执行文件 (*.exe)", Pattern: "*.exe"}},
+	})
+}
+
+// PickProcessFolder asks for a directory whose programs should be accelerated.
+func (a *App) PickProcessFolder() (string, error) {
+	return runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "选择要加速的程序文件夹",
+	})
+}
+
+// SetProcessFolders saves the directories used for process routing.
+func (a *App) SetProcessFolders(paths []string) ([]string, error) {
+	if err := a.ctl.SetProcessFolders(paths); err != nil {
+		return nil, err
+	}
+	return a.ctl.Settings().ProcessFolders, nil
+}
+
+// SetProcesses saves the custom acceleration targets.
+func (a *App) SetProcesses(names []string) ([]string, error) {
+	if err := a.ctl.SetProcesses(names); err != nil {
+		return nil, err
+	}
+	return a.ctl.Settings().Processes, nil
+}
+
 // PickConfigFile asks for a configuration file; "" means cancelled.
 func (a *App) PickConfigFile() (string, error) {
 	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title:   "选择 MSBOOST 节点配置",
-		Filters: []runtime.FileFilter{{DisplayName: "MSBOOST 节点配置 (*.json)", Pattern: "*.json"}},
+		Title:   "选择节点配置",
+		Filters: []runtime.FileFilter{{DisplayName: "节点配置 (*.json)", Pattern: "*.json"}},
 	})
 }
 
@@ -250,8 +300,18 @@ func (a *App) PickConfigFile() (string, error) {
 // written unless overwrite is true.
 func (a *App) ImportConfig(path string, overwrite bool) (ImportResultDTO, error) {
 	entry, err := a.layout.ImportConfig(path, overwrite)
+	return a.finishImport(entry, err)
+}
+
+// ImportLink saves a mierus:// share link as a node JSON file.
+func (a *App) ImportLink(name, link string, overwrite bool) (ImportResultDTO, error) {
+	entry, err := a.layout.ImportLink(name, link, overwrite)
+	return a.finishImport(entry, err)
+}
+
+func (a *App) finishImport(entry store.ConfigEntry, err error) (ImportResultDTO, error) {
 	if errors.Is(err, store.ErrConfigExists) {
-		return ImportResultDTO{Name: filepath.Base(path), Exists: true}, nil
+		return ImportResultDTO{Name: entry.Name, Exists: true}, nil
 	}
 	if err != nil {
 		return ImportResultDTO{}, err
@@ -267,7 +327,7 @@ func (a *App) ImportConfig(path string, overwrite bool) (ImportResultDTO, error)
 // cannot be deleted.
 func (a *App) DeleteConfig(name string) error {
 	st := a.ctl.Status()
-	if st.State != app.StateIdle && st.Config == name {
+	if st.State != app.StateIdle && strings.EqualFold(st.Config, name) {
 		return errors.New("正在使用这个配置加速，请先停止加速")
 	}
 	if err := a.layout.DeleteConfig(name); err != nil {
@@ -287,24 +347,10 @@ func (a *App) OpenFolder(kind string) error {
 	return exec.Command("explorer.exe", dir).Start()
 }
 
-// SetAddon switches Discord or Steam acceleration.
-func (a *App) SetAddon(id string, on bool) error { return a.ctl.SetAddon(id, on) }
-
 // SetTransport chooses TCP or UDP to the node for the next start.
 func (a *App) SetTransport(transport string) error { return a.ctl.SetTransport(transport) }
 
-// SetProbeTarget changes the full-path probe target.
-func (a *App) SetProbeTarget(address string, port int) error {
-	return a.ctl.SetProbeTarget(strings.TrimSpace(address), port)
-}
-
-// ResetProbeTarget restores the default probe target.
-func (a *App) ResetProbeTarget() error {
-	d := store.DefaultSettings().ProbeTarget
-	return a.ctl.SetProbeTarget(d.Address, d.Port)
-}
-
-// RunCheck runs the three network checks.
+// RunCheck runs the exit and DNS checks through the selected node.
 func (a *App) RunCheck() (CheckDTO, error) {
 	ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
 	defer cancel()
@@ -329,7 +375,7 @@ func (a *App) RecentLogs() []LogLineDTO {
 func (a *App) ExportDiagnostics() (string, error) {
 	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
 		Title:           "导出诊断包",
-		DefaultFilename: "MSBOOST-诊断-" + time.Now().Format("20060102-150405") + ".zip",
+		DefaultFilename: "GAMEBOOST-诊断-" + time.Now().Format("20060102-150405") + ".zip",
 		Filters:         []runtime.FileFilter{{DisplayName: "压缩包 (*.zip)", Pattern: "*.zip"}},
 	})
 	if err != nil || path == "" {
@@ -354,13 +400,12 @@ func (a *App) ExportDiagnostics() (string, error) {
 		summary = append(summary, "冲突："+c.Message)
 	}
 	summary = append(summary, app.EnvironmentLines()...)
-	summary = append(summary, a.ctl.GameDNS(a.ctx).Lines()...)
-	if running, err := winsys.ProcessNames(); err == nil {
-		related := app.RelatedProcesses(running)
-		if len(related) == 0 {
-			related = []string{"无"}
-		}
-		summary = append(summary, "游戏相关进程："+strings.Join(related, "、"))
+	settings := a.ctl.Settings()
+	if settings.Mode == store.ModeIP {
+		summary = append(summary, "代理模式：IP 模式", "目标 IP："+strings.Join(settings.Targets, "、"))
+	} else {
+		summary = append(summary, "代理模式：进程模式", "加速进程："+strings.Join(settings.Processes, "、"))
+		summary = append(summary, "运行中的加速进程："+strings.Join(a.ctl.RunningProcesses(), "、"))
 	}
 	var buf bytes.Buffer
 	if err := writeDiagnostics(&buf, a.layout, summary); err != nil {

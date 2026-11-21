@@ -13,38 +13,39 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/mozziexwz/node_launcher/internal/app"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
-	"github.com/mozziexwz/node_launcher/internal/store"
-	"github.com/mozziexwz/node_launcher/internal/winsys"
+	"github.com/mozziexwz/gameboost/internal/app"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/store"
+	"github.com/mozziexwz/gameboost/internal/winsys"
 )
 
 const instanceName = "MSBOOST-Launcher-Core"
 
 func usage() {
-	fmt.Print(`msboostctl：MSBOOST 启动器命令行（开发与验收用）
+	fmt.Print(`msboostctl：GAMEBOOST 命令行（开发与验收用）
 
 用法：msboostctl <命令> [参数]
 
   status                       权限、冲突与当前设置
   configs                      列出 configs\ 中的节点配置（* 为当前配置）
   import <文件> [-overwrite]   导入节点配置到 configs\
+  import-link <名称>           从标准输入读取 mierus:// 链接
   import-legacy <旧版文件夹>   从旧 BAT 启动器文件夹导入配置
   use <配置文件名>             选择节点配置
-  target <IP:端口>             设置全程测速目标
-  addon <discord|steam> <on|off>  可选加速开关
+  mode <process|ip>             选择代理模式
+  processes <进程名或路径...>  保存加速进程清单
+  folders <文件夹路径...>       保存加速文件夹清单
+  ips <地址或CIDR...>           保存目标 IP 清单
   transport <tcp|udp>          连接方式；配置里没有 UDP 时总是 TCP
-  check                        网络检测：到游戏服务器 IPv4、到中转、到游戏
+  check                        检测出口 IPv4、入口延迟和代理目标延迟
   run [-duration 30m]          开始加速，Ctrl+C 停止（需要管理员）
   clean                        清理驱动、防火墙规则与运行文件（需要管理员）
 
@@ -111,7 +112,7 @@ func setup(fs *flag.FlagSet, args []string) (*env, []string, error) {
 func run(cmd string, args []string) error {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	switch cmd {
-	case "status", "configs", "import", "import-legacy", "use", "target", "addon", "transport", "check", "run", "clean":
+	case "status", "configs", "import", "import-link", "import-legacy", "use", "mode", "processes", "folders", "ips", "transport", "check", "run", "clean":
 	default:
 		usage()
 		return fmt.Errorf("未知命令 %q", cmd)
@@ -137,7 +138,21 @@ func run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("已导入 %s（方案 %s，入口 %s）\n", entry.Name, entry.Profile, entry.Entrance)
+		fmt.Printf("已导入 %s（入口 %s）\n", entry.Name, entry.Entrance)
+		return nil
+	case "import-link":
+		if len(rest) != 1 {
+			return errors.New("用法：msboostctl import-link <名称>")
+		}
+		link, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		entry, err := e.layout.ImportLink(rest[0], string(link), *overwrite)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("已导入 %s（入口 %s）\n", entry.Name, entry.Entrance)
 		return nil
 	case "import-legacy":
 		if len(rest) != 1 {
@@ -149,32 +164,17 @@ func run(cmd string, args []string) error {
 			return errors.New("用法：msboostctl use <配置文件名>")
 		}
 		return e.ctl.SelectConfig(rest[0])
-	case "target":
+	case "processes":
+		return e.ctl.SetProcesses(rest)
+	case "folders":
+		return e.ctl.SetProcessFolders(rest)
+	case "ips":
+		return e.ctl.SetTargets(rest)
+	case "mode":
 		if len(rest) != 1 {
-			return errors.New("用法：msboostctl target <IP:端口>")
+			return errors.New("用法：msboostctl mode <process|ip>")
 		}
-		host, portText, err := net.SplitHostPort(rest[0])
-		if err != nil {
-			return fmt.Errorf("格式应为 IP:端口：%w", err)
-		}
-		port, err := strconv.Atoi(portText)
-		if err != nil {
-			return fmt.Errorf("端口无效：%q", portText)
-		}
-		if err := e.ctl.SetProbeTarget(host, port); err != nil {
-			return err
-		}
-		fmt.Printf("全程测速目标：%s\n", rest[0])
-		return nil
-	case "addon":
-		if len(rest) != 2 || (rest[1] != "on" && rest[1] != "off") {
-			return errors.New("用法：msboostctl addon <discord|steam> <on|off>")
-		}
-		if err := e.ctl.SetAddon(rest[0], rest[1] == "on"); err != nil {
-			return err
-		}
-		fmt.Printf("%s：%s\n", rest[0], rest[1])
-		return nil
+		return e.ctl.SetMode(store.RouteMode(rest[0]))
 	case "transport":
 		if len(rest) != 1 || (rest[0] != "tcp" && rest[0] != "udp") {
 			return errors.New("用法：msboostctl transport <tcp|udp>")
@@ -218,15 +218,16 @@ func cmdStatus(e *env) error {
 	fmt.Printf("管理员权限：%v\n", elevated)
 	fmt.Printf("数据目录：%s\n", e.layout.Root)
 	fmt.Printf("当前配置：%s\n", orNone(s.CurrentConfig))
-	fmt.Printf("全程测速目标：%s:%d\n", s.ProbeTarget.Address, s.ProbeTarget.Port)
+	fmt.Printf("代理模式：%s\n", s.Mode)
+	fmt.Printf("加速进程：%s\n", orNone(strings.Join(s.Processes, "、")))
+	fmt.Printf("加速文件夹：%s\n", orNone(strings.Join(s.ProcessFolders, "、")))
+	fmt.Printf("目标 IP：%s\n", orNone(strings.Join(s.Targets, "、")))
+	fmt.Printf("出口检测目标：%s\n", app.ExitTargetURL)
 	transport := "TCP"
 	if s.Transport == "udp" {
 		transport = "UDP（配置里有 UDP 时）"
 	}
 	fmt.Printf("连接方式：%s\n", transport)
-	for _, a := range profiles.Addons() {
-		fmt.Printf("可选加速 %s：%v\n", a.Name, s.Addons[a.ID])
-	}
 	if len(conflicts) == 0 {
 		fmt.Println("冲突检测：无")
 	}
@@ -296,12 +297,17 @@ func cmdCheck(e *env) error {
 		return err
 	}
 	if r.ExitIPError != "" {
-		fmt.Printf("当前到游戏服务器 IPv4：查询失败；%s\n", r.ExitIPError)
+		fmt.Printf("出口 IPv4 查询失败：%s\n", r.ExitIPError)
 	} else {
-		fmt.Printf("当前到游戏服务器 IPv4：%s\n", r.ExitIP)
+		fmt.Printf("出口 IPv4：%s\n", r.ExitIP)
 	}
-	fmt.Printf("当前到中转服务器延迟：%s　%s\n", r.Entrance.Compact(), detail(r.EntranceTarget, r.Entrance.Detail()))
-	fmt.Printf("当前到游戏服务器延迟（%s）：%s　%s\n", strings.ToUpper(r.Transport), r.Game.Compact(), detail(r.GameTarget, r.Game.Detail()))
+	fmt.Printf("入口连接延迟：%s　%s\n", r.Entrance.Compact(), detail(r.EntranceTarget, r.Entrance.Detail()))
+	fmt.Printf("出口 HTTPS 响应延迟（%s）：%s　%s\n", strings.ToUpper(r.Transport), r.Exit.Compact(), detail(r.ExitTarget, r.Exit.Detail()))
+	if r.DNSError != "" {
+		fmt.Printf("节点 DNS 失败：%s\n", r.DNSError)
+	} else {
+		fmt.Println("节点 DNS：正常")
+	}
 	return nil
 }
 
@@ -319,7 +325,7 @@ func cmdRun(e *env, duration time.Duration) error {
 		return err
 	}
 	defer e.ctl.Shutdown()
-	fmt.Println("加速已开始。现在可以打开 MapleStory。按 Ctrl+C 停止。")
+	fmt.Println("加速已开始。现在可以打开对应程序。按 Ctrl+C 停止。")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

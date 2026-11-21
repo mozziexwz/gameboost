@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
+
+	"github.com/mozziexwz/gameboost/internal/doh"
 )
 
 // RelayTarget is the single TCP entrance of the active profile, or the reason
@@ -75,7 +77,7 @@ func ResolveRelay(address string, timeout time.Duration) (string, string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, address)
+	addrs, err := doh.LookupBootstrap(ctx, "ip4", address)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", "中转域名解析超时"
@@ -84,7 +86,7 @@ func ResolveRelay(address string, timeout time.Duration) (string, string) {
 	}
 	unique := make(map[string]bool)
 	for _, a := range addrs {
-		if v4 := a.IP.To4(); v4 != nil {
+		if v4 := a.To4(); v4 != nil {
 			unique[v4.String()] = true
 		}
 	}

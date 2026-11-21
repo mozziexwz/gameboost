@@ -4,10 +4,10 @@ import (
 	"io/fs"
 	"path/filepath"
 
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/runtimefiles"
-	"github.com/mozziexwz/node_launcher/internal/store"
-	"github.com/mozziexwz/node_launcher/internal/winsys"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/runtimefiles"
+	"github.com/mozziexwz/gameboost/internal/store"
+	"github.com/mozziexwz/gameboost/internal/winsys"
 )
 
 // Files of the redirector runtime, checked in this order.

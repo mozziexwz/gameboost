@@ -34,16 +34,6 @@ export function Banner(props: {
     )
 }
 
-export function Switch(props: {checked: boolean, disabled?: boolean, onChange: (v: boolean) => void, label: string}) {
-    return (
-        <label className={'switch' + (props.disabled ? ' disabled' : '')}>
-            <input type="checkbox" checked={props.checked} disabled={props.disabled}
-                   onChange={e => props.onChange(e.target.checked)} aria-label={props.label}/>
-            <span className="track"><span className="thumb"/></span>
-        </label>
-    )
-}
-
 export interface ConfirmRequest {
     title: string
     message: ReactNode

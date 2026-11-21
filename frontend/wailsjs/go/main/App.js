@@ -30,6 +30,10 @@ export function ImportConfig(arg1, arg2) {
   return window['go']['main']['App']['ImportConfig'](arg1, arg2);
 }
 
+export function ImportLink(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ImportLink'](arg1, arg2, arg3);
+}
+
 export function OpenFolder(arg1) {
   return window['go']['main']['App']['OpenFolder'](arg1);
 }
@@ -46,6 +50,14 @@ export function PickConfigFile() {
   return window['go']['main']['App']['PickConfigFile']();
 }
 
+export function PickProcessFiles() {
+  return window['go']['main']['App']['PickProcessFiles']();
+}
+
+export function PickProcessFolder() {
+  return window['go']['main']['App']['PickProcessFolder']();
+}
+
 export function Quit() {
   return window['go']['main']['App']['Quit']();
 }
@@ -54,28 +66,32 @@ export function RecentLogs() {
   return window['go']['main']['App']['RecentLogs']();
 }
 
-export function ResetProbeTarget() {
-  return window['go']['main']['App']['ResetProbeTarget']();
-}
-
 export function RunCheck() {
   return window['go']['main']['App']['RunCheck']();
 }
 
-export function RunningGameProcesses() {
-  return window['go']['main']['App']['RunningGameProcesses']();
+export function RunningProcesses() {
+  return window['go']['main']['App']['RunningProcesses']();
 }
 
 export function SelectConfig(arg1) {
   return window['go']['main']['App']['SelectConfig'](arg1);
 }
 
-export function SetAddon(arg1, arg2) {
-  return window['go']['main']['App']['SetAddon'](arg1, arg2);
+export function SetMode(arg1) {
+  return window['go']['main']['App']['SetMode'](arg1);
 }
 
-export function SetProbeTarget(arg1, arg2) {
-  return window['go']['main']['App']['SetProbeTarget'](arg1, arg2);
+export function SetProcessFolders(arg1) {
+  return window['go']['main']['App']['SetProcessFolders'](arg1);
+}
+
+export function SetProcesses(arg1) {
+  return window['go']['main']['App']['SetProcesses'](arg1);
+}
+
+export function SetTargets(arg1) {
+  return window['go']['main']['App']['SetTargets'](arg1);
 }
 
 export function SetTransport(arg1) {

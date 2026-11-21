@@ -1,8 +1,8 @@
-// Command MSBOOST-Launcher is the MSBOOST desktop launcher (Wails v2).
+// GAMEBOOST is a portable Windows launcher for process-based proxying.
 //
 // It is portable: configs\, logs\, data\ and settings.json live beside the
 // executable. Release builds embed ProxyBridgeCore.dll, WinDivert.dll and
-// WinDivert64.sys and release them to %ProgramData%\MSBOOST (runtime.go);
+// WinDivert64.sys and release them to %ProgramData%\GAMEBOOST (runtime.go);
 // development builds load them from beside the executable.
 package main
 
@@ -17,8 +17,8 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 	xwindows "golang.org/x/sys/windows"
 
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/store"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/store"
 )
 
 //go:embed all:frontend/dist
@@ -40,7 +40,7 @@ func main() {
 	}
 	layout := store.NewLayout(filepath.Dir(exe))
 	if err := layout.Ensure(); err != nil {
-		fatal(err.Error() + "\n请把 MSBOOST 启动器放到可写入的文件夹后再运行。")
+		fatal(err.Error() + "\n请把 GAMEBOOST 放到可写入的文件夹后再运行。")
 	}
 	log, err := logx.New(layout.Logs, 7)
 	if err != nil {
@@ -52,11 +52,8 @@ func main() {
 		fatal(err.Error())
 	}
 	a := NewApp(layout, log, rt, exe)
-	// Like Netch, the window has a fixed size and no maximise button: 776×337
-	// leaves about a 760×298 client area once Windows adds the title bar and
-	// borders.
 	err = wails.Run(&options.App{
-		Title:            "MSBOOST 启动器",
+		Title:            "GAMEBOOST",
 		Width:            776,
 		Height:           337,
 		DisableResize:    true,
@@ -66,7 +63,7 @@ func main() {
 		OnBeforeClose:    a.beforeClose,
 		OnShutdown:       a.shutdown,
 		SingleInstanceLock: &options.SingleInstanceLock{
-			UniqueId:               "msboost-launcher-6f1d2c9e",
+			UniqueId:               "gameboost-launcher-6f1d2c9e",
 			OnSecondInstanceLaunch: a.onSecondInstance,
 		},
 		Windows: &windows.Options{
@@ -81,7 +78,7 @@ func main() {
 
 // fatal reports a startup failure before any window exists.
 func fatal(message string) {
-	title, _ := xwindows.UTF16PtrFromString("MSBOOST 启动器")
+	title, _ := xwindows.UTF16PtrFromString("GAMEBOOST")
 	text, _ := xwindows.UTF16PtrFromString(message)
 	xwindows.MessageBox(0, text, title, xwindows.MB_OK|xwindows.MB_ICONERROR)
 	os.Exit(1)

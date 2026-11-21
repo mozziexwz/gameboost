@@ -30,11 +30,8 @@ func TestSettingsDefaultsAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("missing settings must not be an error: %v", err)
 	}
-	if s.ProbeTarget.Address != "35.155.204.207" || s.ProbeTarget.Port != 8585 {
-		t.Fatalf("default probe target %+v", s.ProbeTarget)
-	}
-	if s.Addons["discord"] || s.Addons["steam"] || len(s.Addons) != 2 {
-		t.Fatalf("addons must exist and default to off: %v", s.Addons)
+	if s.Mode != ModeProcess || len(s.Targets) != 0 || len(s.Processes) != 0 {
+		t.Fatalf("defaults: %+v", s)
 	}
 
 	if s.Transport != "" {
@@ -42,8 +39,9 @@ func TestSettingsDefaultsAndRoundTrip(t *testing.T) {
 	}
 
 	s.CurrentConfig = "直连.json"
-	s.ProbeTarget = ProbeTarget{Address: "51.222.56.192", Port: 8484}
-	s.Addons["discord"] = true
+	s.Processes = []string{"Example.exe"}
+	s.Mode = ModeIP
+	s.Targets = []string{"203.0.113.0/24", "2001:db8::1"}
 	s.Transport = "udp"
 	if err := l.SaveSettings(s); err != nil {
 		t.Fatal(err)
@@ -52,25 +50,42 @@ func TestSettingsDefaultsAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.CurrentConfig != "直连.json" || got.ProbeTarget.Port != 8484 || !got.Addons["discord"] || got.Addons["steam"] || got.Transport != "udp" {
+	if got.CurrentConfig != "直连.json" || got.Mode != ModeIP || len(got.Targets) != 2 || got.Transport != "udp" {
 		t.Fatalf("round trip %+v", got)
+	}
+	if len(got.Processes) != 1 || got.Processes[0] != "Example.exe" {
+		t.Fatalf("processes did not persist: %v", got.Processes)
 	}
 }
 
 func TestSettingsRejectInvalidValues(t *testing.T) {
 	l := NewLayout(t.TempDir())
 	for name, mutate := range map[string]func(*Settings){
-		"private probe target": func(s *Settings) { s.ProbeTarget.Address = "10.0.0.1" },
-		"bad probe port":       func(s *Settings) { s.ProbeTarget.Port = 70000 },
-		"unknown addon":        func(s *Settings) { s.Addons["vpn"] = true },
-		"path in config name":  func(s *Settings) { s.CurrentConfig = `..\x.json` },
-		"unknown transport":    func(s *Settings) { s.Transport = "quic" },
+		"path in config name": func(s *Settings) { s.CurrentConfig = `..\x.json` },
+		"unknown transport":   func(s *Settings) { s.Transport = "quic" },
 	} {
 		s := DefaultSettings()
 		mutate(&s)
 		if err := l.SaveSettings(s); err == nil {
 			t.Errorf("%s: SaveSettings accepted invalid settings", name)
 		}
+	}
+}
+
+func TestSettingsIgnoreLegacyProbeTarget(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	writeFile(t, l.Settings, []byte(`{"version":3,"currentConfig":"直连.json","transport":"udp","mode":"ip","targets":["203.0.113.10"],"probeTarget":{"address":"127.0.0.1","port":70000}}`))
+	s, err := l.LoadSettings()
+	if err != nil || s.CurrentConfig != "直连.json" || s.Transport != "udp" || s.Mode != ModeIP ||
+		len(s.Targets) != 1 || s.Targets[0] != "203.0.113.10" {
+		t.Fatalf("legacy target must not discard other settings: %+v, %v", s, err)
+	}
+	if err := l.SaveSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(l.Settings)
+	if err != nil || strings.Contains(string(saved), `"probeTarget"`) {
+		t.Fatalf("obsolete probe target was saved: %s, %v", saved, err)
 	}
 }
 
@@ -81,17 +96,36 @@ func TestSettingsCorruptFileFallsBackToDefaults(t *testing.T) {
 	if err == nil {
 		t.Fatal("a corrupt file must be reported")
 	}
-	if s.ProbeTarget != DefaultSettings().ProbeTarget {
+	if s.Mode != ModeProcess || s.CurrentConfig != "" || s.Transport != "" {
 		t.Fatalf("corrupt settings must fall back to defaults: %+v", s)
 	}
-	writeFile(t, l.Settings, []byte(`{"version":1,"probeTarget":{"address":"192.168.1.1","port":1}}`))
-	if _, err := l.LoadSettings(); err == nil {
-		t.Fatal("an invalid probe target must be reported")
-	}
-	writeFile(t, l.Settings, []byte(`{"version":1,"probeTarget":{"address":"51.222.56.192","port":8484}}`))
+	writeFile(t, l.Settings, []byte(`{"version":1,"probeTarget":{"address":"192.0.2.10","port":8484}}`))
 	s, err = l.LoadSettings()
-	if err != nil || len(s.Addons) != 2 {
-		t.Fatalf("missing addon keys must be filled: %+v %v", s, err)
+	if err != nil || s.Mode != ModeProcess || len(s.Processes) == 0 {
+		t.Fatalf("v1 settings with a custom target must migrate: %+v %v", s, err)
+	}
+}
+
+func TestImportMierusLinkPreservesBindingsAndProtectsCredentials(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	link := "mierus://user:p%40ss@192.0.2.9?profile=link&protocol=TCP&port=8964&protocol=UDP&port=8964"
+	entry, err := l.ImportLink("测试节点", link, false)
+	if err != nil || entry.Name != "测试节点.json" || !entry.UDP || entry.Entrance != "192.0.2.9:8964" {
+		t.Fatalf("link import: %+v, %v", entry, err)
+	}
+	cfg, err := l.LoadConfig(entry.Name)
+	if err != nil || cfg.Profile.GetUser().GetPassword() != "p@ss" {
+		t.Fatalf("imported credentials were not decoded: %v", err)
+	}
+	if _, err := l.ImportLink("测试节点", link, false); err != nil {
+		t.Fatalf("reimporting the same link: %v", err)
+	}
+	other := strings.ReplaceAll(link, "8964", "8965")
+	if _, err := l.ImportLink("测试节点", other, false); !errors.Is(err, ErrConfigExists) {
+		t.Fatalf("import overwrote an existing configuration: %v", err)
+	}
+	if _, err := l.ImportLink("invalid", "mierus://user:credential%paper@192.0.2.9", false); err == nil || strings.Contains(err.Error(), "credential") {
+		t.Fatalf("malformed link exposed or accepted its credential: %v", err)
 	}
 }
 

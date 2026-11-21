@@ -72,26 +72,6 @@ export namespace main {
 		    return a;
 		}
 	}
-	export class AddonDTO {
-	    id: string;
-	    name: string;
-	    note: string;
-	    processes: string[];
-	    enabled: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new AddonDTO(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.name = source["name"];
-	        this.note = source["note"];
-	        this.processes = source["processes"];
-	        this.enabled = source["enabled"];
-	    }
-	}
 	export class ResultDTO {
 	    text: string;
 	    detail: string;
@@ -115,8 +95,10 @@ export namespace main {
 	    exitIPError: string;
 	    entranceTarget: string;
 	    entrance: ResultDTO;
-	    gameTarget: string;
-	    game: ResultDTO;
+	    exitTarget: string;
+	    exit: ResultDTO;
+	    dnsError: string;
+	    transport: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new CheckDTO(source);
@@ -128,8 +110,10 @@ export namespace main {
 	        this.exitIPError = source["exitIPError"];
 	        this.entranceTarget = source["entranceTarget"];
 	        this.entrance = this.convertValues(source["entrance"], ResultDTO);
-	        this.gameTarget = source["gameTarget"];
-	        this.game = this.convertValues(source["game"], ResultDTO);
+	        this.exitTarget = source["exitTarget"];
+	        this.exit = this.convertValues(source["exit"], ResultDTO);
+	        this.dnsError = source["dnsError"];
+	        this.transport = source["transport"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -155,6 +139,7 @@ export namespace main {
 	    name: string;
 	    profile: string;
 	    entrance: string;
+	    udp: boolean;
 	    error: string;
 	    current: boolean;
 	
@@ -167,6 +152,7 @@ export namespace main {
 	        this.name = source["name"];
 	        this.profile = source["profile"];
 	        this.entrance = source["entrance"];
+	        this.udp = source["udp"];
 	        this.error = source["error"];
 	        this.current = source["current"];
 	    }
@@ -185,20 +171,6 @@ export namespace main {
 	        this.message = source["message"];
 	        this.blocking = source["blocking"];
 	        this.fix = source["fix"];
-	    }
-	}
-	export class GroupDTO {
-	    name: string;
-	    processes: string[];
-	
-	    static createFrom(source: any = {}) {
-	        return new GroupDTO(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.name = source["name"];
-	        this.processes = source["processes"];
 	    }
 	}
 	export class ImportResultDTO {
@@ -243,8 +215,8 @@ export namespace main {
 	    uploadRate: number;
 	    downloadRate: number;
 	    systemProxy: string[];
+	    transport: string;
 	    lastError: string;
-	    addons: Record<string, boolean>;
 	
 	    static createFrom(source: any = {}) {
 	        return new StatusDTO(source);
@@ -260,17 +232,19 @@ export namespace main {
 	        this.uploadRate = source["uploadRate"];
 	        this.downloadRate = source["downloadRate"];
 	        this.systemProxy = source["systemProxy"];
+	        this.transport = source["transport"];
 	        this.lastError = source["lastError"];
-	        this.addons = source["addons"];
 	    }
 	}
 	export class OverviewDTO {
 	    status: StatusDTO;
 	    configs: ConfigDTO[];
-	    addons: AddonDTO[];
-	    gameGroups: GroupDTO[];
-	    probeAddress: string;
-	    probePort: number;
+	    mode: string;
+	    processes: string[];
+	    processFolders: string[];
+	    targets: string[];
+	    exitTarget: string;
+	    transport: string;
 	    elevated: boolean;
 	    conflicts: ConflictDTO[];
 	    lockError: string;
@@ -286,10 +260,12 @@ export namespace main {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.status = this.convertValues(source["status"], StatusDTO);
 	        this.configs = this.convertValues(source["configs"], ConfigDTO);
-	        this.addons = this.convertValues(source["addons"], AddonDTO);
-	        this.gameGroups = this.convertValues(source["gameGroups"], GroupDTO);
-	        this.probeAddress = source["probeAddress"];
-	        this.probePort = source["probePort"];
+	        this.mode = source["mode"];
+	        this.processes = source["processes"];
+	        this.processFolders = source["processFolders"];
+	        this.targets = source["targets"];
+	        this.exitTarget = source["exitTarget"];
+	        this.transport = source["transport"];
 	        this.elevated = source["elevated"];
 	        this.conflicts = this.convertValues(source["conflicts"], ConflictDTO);
 	        this.lockError = source["lockError"];

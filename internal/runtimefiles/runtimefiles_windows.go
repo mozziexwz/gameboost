@@ -18,7 +18,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mozziexwz/node_launcher/internal/winsys"
+	"github.com/mozziexwz/gameboost/internal/winsys"
 )
 
 // Manager owns one set of embedded files and their release folder.
@@ -26,7 +26,7 @@ type Manager struct {
 	files  fs.FS
 	names  []string
 	sums   map[string][sha256.Size]byte
-	base   string // %ProgramData%\MSBOOST
+	base   string // %ProgramData%\GAMEBOOST
 	digest string
 
 	// secure locks a folder down; tests replace it when not elevated.

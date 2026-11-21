@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mozziexwz/node_launcher/internal/store"
+	"github.com/mozziexwz/gameboost/internal/store"
 )
 
 func TestDiagnosticsNeverContainConfigContents(t *testing.T) {

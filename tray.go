@@ -5,7 +5,7 @@ import (
 
 	"fyne.io/systray"
 
-	"github.com/mozziexwz/node_launcher/internal/app"
+	"github.com/mozziexwz/gameboost/internal/app"
 )
 
 type trayActions struct {
@@ -38,7 +38,7 @@ func startTray(icons trayIcons, actions trayActions) *tray {
 
 func (t *tray) build(actions trayActions) {
 	systray.SetIcon(t.icons.idle)
-	systray.SetTooltip("MSBOOST 启动器")
+	systray.SetTooltip("GAMEBOOST")
 	systray.SetOnTapped(actions.show) // left click opens the window
 	show := systray.AddMenuItem("显示主窗口", "")
 	t.toggle = systray.AddMenuItem("开始加速", "")
@@ -72,7 +72,7 @@ func (t *tray) setState(state app.State) {
 		t.toggle.SetTitle("停止加速")
 		t.toggle.Enable()
 		systray.SetIcon(t.icons.running)
-		systray.SetTooltip("MSBOOST 启动器 - 加速中")
+		systray.SetTooltip("GAMEBOOST · 加速中")
 	case app.StateStarting:
 		t.toggle.SetTitle("正在开始加速…")
 		t.toggle.Disable()
@@ -83,7 +83,7 @@ func (t *tray) setState(state app.State) {
 		t.toggle.SetTitle("开始加速")
 		t.toggle.Enable()
 		systray.SetIcon(t.icons.idle)
-		systray.SetTooltip("MSBOOST 启动器")
+		systray.SetTooltip("GAMEBOOST")
 	}
 }
 

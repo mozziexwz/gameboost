@@ -1,6 +1,6 @@
 import {useState} from 'react'
-import {api, errorText, Overview, Transport} from '../api'
-import {Banner, Spinner, Switch} from '../components'
+import {api, errorText, Overview, RouteMode, Transport} from '../api'
+import {Banner, Spinner} from '../components'
 import {canCheck, CheckState, checkLabel, shortResult} from './Check'
 
 const fixLabels: Record<string, string> = {
@@ -17,14 +17,14 @@ const stateText = {
 // CheckSummary is the one-line form of the network check on the home page.
 function CheckSummary(props: {check: CheckState}) {
     const {result: r, running, error} = props.check
-    if (running) return <span className="summary none"><Spinner/>正在检测 MSBOOST IPv4 和延迟…</span>
+    if (running) return <span className="summary none"><Spinner/>正在检测出口 IPv4 和延迟…</span>
     if (error) return <span className="summary"><b className="bad">检测失败</b></span>
-    if (!r) return <span className="summary none"><span>MSBOOST IPv4 —</span><span>中转 —</span><span>游戏 —</span></span>
+    if (!r) return <span className="summary none">IPv4 —　入口 —　目标 —</span>
     return (
         <span className="summary">
-            <span>MSBOOST IPv4 <b className={r.exitIP ? '' : 'bad'}>{r.exitIP || '查询失败'}</b></span>
-            <span>中转 <b className={r.entrance.ok ? 'ok' : 'bad'}>{shortResult(r.entrance)}</b></span>
-            <span>游戏 <b className={r.game.ok ? 'ok' : 'bad'}>{shortResult(r.game)}</b></span>
+            <span>IPv4 <b className={r.exitIP ? '' : 'bad'}>{r.exitIP || '查询失败'}</b></span>
+            <span>入口 <b className={r.entrance.ok ? 'ok' : 'bad'}>{shortResult(r.entrance)}</b></span>
+            <span>目标 <b className={r.exit.ok ? 'ok' : 'bad'}>{shortResult(r.exit)}</b></span>
         </span>
     )
 }
@@ -36,6 +36,7 @@ export function Home(props: {
     check: CheckState
     goConfigs: () => void
     goCheck: () => void
+    goRules: () => void
 }) {
     const o = props.overview
     const st = o.status
@@ -48,21 +49,21 @@ export function Home(props: {
     const [fixing, setFixing] = useState('')
     const [fixReport, setFixReport] = useState<string[]>([])
 
-    const hasCurrent = validConfigs.some(c => c.current)
-    const canStart = !busy && o.elevated && !o.lockError && hasCurrent && blocking.length === 0
+    const current = validConfigs.find(c => c.current)
+    const routeCount = o.mode === 'ip' ? o.targets.length : o.processes.length + (o.processFolders?.length ?? 0)
+    const canStart = !busy && o.elevated && !o.lockError && !!current && routeCount > 0 && blocking.length === 0
     // Only a node that serves UDP offers the choice. While accelerating the
     // control shows what is in use, which is TCP after a UDP fallback.
-    const offersUDP = validConfigs.some(c => c.current && c.udp)
-    const shownTransport: Transport = st.state === 'idle' || !st.transport ? o.transport : st.transport
+    const shownTransport = st.state === 'idle' || !st.transport ? o.transport : st.transport
 
     const toggle = async () => {
         setError('')
         try {
             if (running) {
-                const game = await api.runningGame()
-                if (game.length > 0 && !await props.confirm('停止加速',
-                    `MapleStory 正在运行（${game.join('、')}），停止加速会断开游戏连接。确定停止吗？`, '停止加速', true)) {
-                    return
+                const processes = await api.runningProcesses()
+                if (o.mode === 'ip' || processes.length > 0) {
+                    const note = processes.length ? `正在运行 ${processes.join('、')}。` : ''
+                    if (!await props.confirm('停止加速', note + '停止加速会断开代理连接。确定停止吗？', '停止加速', true)) return
                 }
                 await api.stop()
             } else {
@@ -95,10 +96,10 @@ export function Home(props: {
         await props.refresh()
     }
 
-    const switchAddon = async (id: string, on: boolean) => {
+    const chooseMode = async (mode: RouteMode) => {
         setError('')
         try {
-            await api.setAddon(id, on)
+            await api.setMode(mode)
         } catch (e) {
             setError(errorText(e))
         }
@@ -107,8 +108,7 @@ export function Home(props: {
 
     const fixConflict = async (fix: string) => {
         if (!await props.confirm('停止 ProxyBridge',
-            'MSBOOST 会让 ProxyBridge 退出（和它托盘菜单里的“退出”一样），并停止它的后台服务（ProxyBridgeSvc）。' +
-            '如果它设置了开机启动，下次开机还会运行；不再使用的话，建议卸载 ProxyBridge。确定继续吗？', '停止', true)) {
+            'GAMEBOOST 会退出 ProxyBridge 并停止其后台服务（ProxyBridgeSvc）。确定继续吗？', '停止', true)) {
             return
         }
         setFixing(fix)
@@ -135,12 +135,13 @@ export function Home(props: {
     const note = running ? [
             st.transport ? `经 ${st.transport.toUpperCase()} 连接节点` : '',
             st.systemProxy && st.systemProxy.length > 0
-                ? `已接管系统代理 ${st.systemProxy.join('、')}：游戏发往它的请求改由 MSBOOST 发出` : '',
-        ].filter(Boolean).join('；')
-        : st.state === 'starting' ? '正在连接 MSBOOST 节点并加载分流驱动…'
+                ? `已接管加速进程的系统代理连接（${st.systemProxy.join('、')}）` : '',
+        ].filter(Boolean).join(' · ')
+        : st.state === 'starting' ? '正在加载分流组件…'
         : st.state === 'stopping' ? '正在断开连接并卸载分流驱动…'
-        : !hasCurrent ? '请先在上方选择节点配置'
-        : '开始加速后再打开 MapleStory'
+        : !current ? '请先选择节点配置'
+        : routeCount === 0 ? (o.mode === 'ip' ? '请先添加并保存目标 IP' : '请先添加并保存加速进程或文件夹')
+        : '开始加速后再打开对应程序'
 
     return (
         <div className="page home">
@@ -153,27 +154,21 @@ export function Home(props: {
             {fixReport.length > 0 && <Banner kind="info" onClose={() => setFixReport([])}>{fixReport.join('；')}</Banner>}
             {error && <Banner kind="error" onClose={() => setError('')}>{error}</Banner>}
             {warnings.map(w => <Banner key={w} kind="warn" onClose={() => setWarnings(ws => ws.filter(x => x !== w))}>{w}</Banner>)}
-            {props.check.result && !props.check.result.dns.ok && (
-                <Banner kind="warn" action={{label: '详情', onClick: props.goCheck}}>
-                    本机 DNS 解析不了游戏域名，游戏可能登录不了。
-                </Banner>
-            )}
-
             <section className="lines">
                 <div className="line">
                     <span className="line-label">节点配置</span>
                     {validConfigs.length === 0
-                        ? <span className="muted">还没有可用的节点配置，请先<button className="link" onClick={props.goConfigs}>导入配置</button></span>
+                        ? <span className="muted">还没有可用的节点配置。</span>
                         : (
-                            <select value={validConfigs.find(c => c.current)?.name ?? ''} disabled={st.state !== 'idle'}
+                            <select aria-label="当前节点" value={current?.name ?? ''} disabled={st.state !== 'idle'}
                                     title={st.state !== 'idle' ? '加速中不能切换配置，请先停止加速' : undefined}
                                     onChange={e => select(e.target.value)}>
-                                {!hasCurrent && <option value="" disabled>请选择节点配置</option>}
+                                {!current && <option value="" disabled>请选择节点配置</option>}
                                 {validConfigs.map(c => <option key={c.name} value={c.name}>{c.name.replace(/\.json$/i, '')}</option>)}
                             </select>
                         )}
                     <span className="line-actions">
-                        {offersUDP && (
+                        {current?.udp && (
                             <div className="segmented compact" role="group" aria-label="连接方式"
                                  title={st.state !== 'idle' ? '加速中不能切换连接方式，请先停止加速' : 'UDP 连不上节点时会自动改用 TCP'}>
                                 {(['tcp', 'udp'] as Transport[]).map(t => (
@@ -186,19 +181,20 @@ export function Home(props: {
                     </span>
                 </div>
                 <div className="line">
-                    <span className="line-label">可选加速</span>
-                    <div className="toggles">
-                        {o.addons.map(a => (
-                            <span className="toggle" key={a.id} title={a.note}>
-                                <Switch label={a.name} checked={a.enabled} disabled={busy} onChange={v => switchAddon(a.id, v)}/>
-                                {a.name}
-                            </span>
-                        ))}
+                    <span className="line-label">代理模式</span>
+                    <div className="route-choice">
+                        <div className="segmented compact" role="group" aria-label="代理模式">
+                            <button className={o.mode === 'process' ? 'on' : ''} aria-pressed={o.mode === 'process'}
+                                    disabled={st.state !== 'idle'} onClick={() => chooseMode('process')}>进程模式</button>
+                            <button className={o.mode === 'ip' ? 'on' : ''} aria-pressed={o.mode === 'ip'}
+                                    disabled={st.state !== 'idle'} onClick={() => chooseMode('ip')}>IP 模式</button>
+                        </div>
+                        <span className="muted small">已配置 {routeCount} 项</span>
                     </div>
-                    <span className="hint">{running ? '加速中切换只对新连接生效' : ''}</span>
+                    <button className="link" onClick={props.goRules}>管理</button>
                 </div>
                 <div className="line">
-                    <span className="line-label">网络检测</span>
+                    <span className="line-label">出口检测</span>
                     <CheckSummary check={props.check}/>
                     <span className="line-actions">
                         <button className="small" onClick={props.check.run} disabled={!canCheck(o, props.check)}>{checkLabel(props.check)}</button>

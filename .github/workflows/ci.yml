@@ -83,6 +83,10 @@ jobs:
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           wails build -clean -m -platform windows/amd64 -tags bundle -ldflags "-X main.version=$version"
 
+      - name: Verify the native window icon
+        shell: pwsh
+        run: ./scripts/verify-window-icon.ps1
+
       # The portable release: one exe plus the license files.
       - name: Assemble release folder
         shell: pwsh
@@ -91,13 +95,13 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           go run ./scripts/notices -o "$dir/THIRD_PARTY_NOTICES.txt"
           if ($LASTEXITCODE -ne 0) { throw 'notices failed' }
-          Copy-Item build/bin/MSBOOST-Launcher.exe $dir/
+          Copy-Item build/bin/GAMEBOOST.exe $dir/
           Copy-Item LICENSE "$dir/LICENSE.txt"
           (Get-ChildItem $dir -File) | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name } | Set-Content "$dir/SHA256SUMS.txt"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MSBOOST-Launcher-${{ env.VERSION }}-windows-x64
+          name: GAMEBOOST-${{ env.VERSION }}-windows-x64
           path: build/release/
           if-no-files-found: error
 
@@ -113,18 +117,18 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: MSBOOST-Launcher-${{ github.ref_name }}-windows-x64
+          name: GAMEBOOST-${{ github.ref_name }}-windows-x64
           path: package
 
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          name="MSBOOST-Launcher-${GITHUB_REF_NAME}-windows-x64"
+          name="GAMEBOOST-${GITHUB_REF_NAME}-windows-x64"
           (cd package && zip -9 -r "../${name}.zip" .)
           sha256sum "${name}.zip" > "${name}.zip.sha256"
           # docs/releases/<tag>.md if written, otherwise the template.
           notes="docs/releases/${GITHUB_REF_NAME}.md"
           [ -f "$notes" ] || notes=docs/release-notes-template.md
           sed "s/{{VERSION}}/${GITHUB_REF_NAME}/g" "$notes" > notes.md
-          gh release create "$GITHUB_REF_NAME" "${name}.zip" "${name}.zip.sha256" --draft --verify-tag --title "MSBOOST 启动器 ${GITHUB_REF_NAME}" --notes-file notes.md
+          gh release create "$GITHUB_REF_NAME" "${name}.zip" "${name}.zip.sha256" --draft --verify-tag --title "GAMEBOOST ${GITHUB_REF_NAME}" --notes-file notes.md

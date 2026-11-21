@@ -30,7 +30,8 @@ type Game struct {
 	TestPort          int
 }
 
-// DefaultMapleStory is the process list. It began as the user's ProxyBridge
+// DefaultMapleStory is the legacy v1 process list used to migrate settings.
+// It began as the user's ProxyBridge
 // profile that passed real MapleStory testing on 2026-10-12 (login, channels,
 // channel changes, anti-cheat quiet), kept verbatim including mr.dll.
 //
@@ -100,43 +101,8 @@ func DisplayGroups() []Group {
 // mswWebHelper is MapleStory Worlds' web view helper. Other apps use the name
 // cefhelper.exe too, so it is matched by path: the core compares a pattern
 // containing a backslash with the full image path, and RunningMatches skips
-// wildcard patterns, so it never counts as a running game either.
+// this wildcard, so it never counts as a running game either.
 const mswWebHelper = `*\ToyWebView\cefhelper.exe`
-
-// Addon is an optional app accelerated alongside the game. Like the game's,
-// its process list is fixed: users can only switch an addon on or off.
-type Addon struct {
-	ID        string
-	Name      string
-	Processes []string
-	Protocol  Protocol
-	Note      string // shown next to the switch
-}
-
-// ProcessList joins the processes into ProxyBridge's semicolon-separated form.
-func (a Addon) ProcessList() string {
-	return strings.Join(a.Processes, ";")
-}
-
-// Addons lists the optional accelerations. All are off by default.
-func Addons() []Addon {
-	return []Addon{
-		{
-			ID:        "discord",
-			Name:      "Discord",
-			Processes: []string{"Discord.exe", "DiscordPTB.exe", "DiscordCanary.exe"},
-			Protocol:  ProtocolBoth,
-			Note:      "语音使用 UDP，一并加速",
-		},
-		{
-			ID:        "steam",
-			Name:      "Steam",
-			Processes: []string{"steam.exe", "steamwebhelper.exe"},
-			Protocol:  ProtocolBoth,
-			Note:      "Steam 下载也会经过节点，会消耗节点流量",
-		},
-	}
-}
 
 // Domain is a host name the game looks up through this computer's own DNS.
 type Domain struct {
@@ -193,10 +159,12 @@ func ValidateProcessName(name string) error {
 		return errors.New("进程名不能为空")
 	case trimmed != name:
 		return fmt.Errorf("进程名首尾不能有空格：%q", name)
-	case strings.ContainsAny(name, ";\x00"):
-		return fmt.Errorf("进程名不能包含分号：%q", name)
+	case strings.ContainsAny(name, ",;\"\x00\r\n\t"):
+		return fmt.Errorf("进程名或路径包含无效字符：%q", name)
 	case strings.Trim(name, "*") == "":
 		return fmt.Errorf("进程名不能只有通配符：%q", name)
+	case strings.EqualFold(name, "ANY"):
+		return errors.New("请填写具体进程名或路径，不能使用 ANY 匹配全部程序")
 	}
 	return nil
 }

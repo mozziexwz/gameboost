@@ -1,51 +1,40 @@
-# MSBOOST 启动器（node_launcher）
+# GAMEBOOST
 
-把 mieru 客户端和按进程分流合并成一个带界面的 Windows 程序：导入节点配置 → 开始加速 → 打开冒险岛。
+GAMEBOOST 是基于 [node_launcher](https://github.com/mozziexwz/node_launcher) 的 Windows 游戏加速启动器，支持按进程或目标 IP 分流。
 
-- 只代理冒险岛相关进程（可选加上 Discord、Steam），其他软件直连。
-- 不改路由表、DNS 和系统代理，也不装虚拟网卡。
+## 使用
 
-> **状态：已正式发布，下载见 [Releases](https://github.com/mozziexwz/node_launcher/releases)。** 各版本说明在 [docs/releases/](docs/releases/)，规划见 [docs/MSBOOST一体化启动器开发规划.md](docs/MSBOOST一体化启动器开发规划.md)。
+1. 在 64 位 Windows 10 或 11 上运行 `GAMEBOOST.exe`，按提示授予管理员权限以加载 WinDivert。
+2. 在「节点配置」中导入 mieru JSON 文件，或点击「导入链接」粘贴 `mierus://` 分享链接。
+3. 在「分流规则」选模式并保存清单。进程模式支持进程名、可执行文件完整路径和文件夹。添加文件夹会匹配该目录及其子目录中的程序。IP 模式填写目标 IPv4、IPv6 或 CIDR 网段，按连接的实际目的地址匹配。
+4. 在「加速」选择节点并开始加速，再打开对应程序。底部状态栏显示累计节点流量和实时上下行速率。
+5. 在「出口检测」中查看出口公网 IPv4、节点入口延迟，以及经当前代理访问 `https://ip.sb/` 的 HTTPS 响应延迟。程序发起两次请求，取较快的响应。
 
-## 组成
+节点配置和设置保存在可执行文件旁的 `configs/` 和 `settings.json`。分享链接及保存后的节点配置可能包含节点凭据。
 
-| 组件 | 版本 | 用途 |
-|---|---|---|
-| [mieru](https://github.com/enfein/mieru) | v3.39.0 | 进程内嵌入，提供本地 SOCKS5（只监听 127.0.0.1，端口随机，每次启动生成会话凭据） |
-| [ProxyBridge](https://github.com/InterceptSuite/ProxyBridge) 核心 | v4.1.0 | 编译为 `ProxyBridgeCore.dll`，基于 WinDivert 把指定进程的流量转进本地 SOCKS5 |
-| [WinDivert](https://github.com/basil00/WinDivert) | 2.2.2-A | 官方签名的驱动与库，原样分发 |
-| [Wails](https://wails.io) v2 + React/TypeScript | v2.16.0 | 界面 |
+### DNS 防泄露
 
-## 目录
+启动加速后，WinDivert 接管本机 IPv4 和 IPv6 的 UDP/TCP 53 查询，使用当前节点访问 Cloudflare DoH。Windows 当前配置的 DNS 服务器和常见加密解析器的 TCP DoH，以及 TCP 853 上的 DoT，经节点中继。加速期间会阻止这些解析器的 QUIC 回落及局域网名称广播。节点断开时，受保护的 DNS 请求失败，停止加速会释放临时过滤器。
 
-```text
-main.go, app.go, tray.go   Wails 界面入口、前端绑定、托盘
-frontend/      界面（React + TypeScript + Vite）
-internal/      app（启停控制）、engine（嵌入 mieru）、redirector（ProxyBridgeCore.dll）、probe（网络检测）、sysproxy、profiles、store、winsys 等
-cmd/msboostctl/  命令行开发与验收工具，走与界面相同的控制流程，不随发布包分发
-docs/          规划与设计文档；各里程碑验收记录（docs/m0~m3/、docs/v*/）；发布说明（docs/releases/）
-legacy/        旧版 BAT 启动器与已移植为 Go 测试的 PowerShell 用例，仅供参考，不参与构建
-scripts/       获取 WinDivert、编译 ProxyBridgeCore.dll、生成图标与第三方许可等脚本
-third_party/   ProxyBridge 子模块（固定 v4.1.0）及补丁，WinDivert 校验值
-```
+进程模式也分流名单内应用自行发出的 HTTPS。IP 模式按连接地址匹配，应用自带且位于 DNS 保护范围及目标清单之外的 HTTPS 连接仍按 IP 规则处理。节点域名的启动解析使用固定地址上的 HTTPS。
 
-构建界面：安装 Wails CLI v2.16.0（`go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0`），然后在仓库根目录执行 `wails build`，产物为 `build/bin/MSBOOST-Launcher.exe`。
+## 构建
 
-## 开发环境
-
-- Windows 10/11 x64
-- Go 1.27.1、Node.js 24
-- Visual Studio 2022 Build Tools（“使用 C++ 的桌面开发”），用于编译 `ProxyBridgeCore.dll`
+需要 Go 1.27.1、Node.js 24、Wails CLI v2.16.0 和包含 C++ 桌面开发组件的 Visual Studio 2022 Build Tools。
 
 ```powershell
-git clone --recurse-submodules https://github.com/mozziexwz/node_launcher.git
-cd node_launcher
-.\scripts\fetch-windivert.ps1   # 下载并校验 WinDivert 2.2.2-A
-.\scripts\build-core.ps1        # 编译 ProxyBridgeCore.dll（需要 MSVC）
+git submodule update --init
+.\scripts\fetch-windivert.ps1
+.\scripts\build-core.ps1
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0
+go test ./...
+wails build -clean -m -platform windows/amd64 -tags bundle
 ```
+
+便携版输出到 `build/bin/GAMEBOOST.exe`，内置 ProxyBridge 4.1.0 和 WinDivert 2.2.2-A。仓库包含上游的开发记录和用于测试的 `cmd/msboostctl`。
+
+在管理员 PowerShell 中运行 `./scripts/e2e-windows.ps1 -Outbound`，使用本机测试节点验证 WinDivert 分流和 DNS。验收日志写入 `.cache/e2e/windows-e2e-outbound.log`。
 
 ## 许可
 
-本项目使用 [GPL-3.0](LICENSE) 许可。第三方组件及其许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-本项目与 ProxyBridge / InterceptSuite、mieru、WinDivert 的作者没有隶属关系，感谢这些项目。
+项目使用 [GPL-3.0](LICENSE)。第三方组件的版权与许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

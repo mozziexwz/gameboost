@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
 	"github.com/enfein/mieru/v3/pkg/protocol"
 	"github.com/enfein/mieru/v3/pkg/socks5"
+
+	"github.com/mozziexwz/gameboost/internal/doh"
 )
 
 // Engine is a running embedded mieru client with its local SOCKS5 endpoint.
@@ -24,6 +27,7 @@ type Engine struct {
 	meter    *trafficMeter
 	user     string
 	password string
+	dnsFlows []doh.Flow
 	served   chan struct{}
 	stop     chan struct{}
 
@@ -58,8 +62,12 @@ func Start(cfg *Config, listenPort int) (*Engine, error) {
 		return nil, err
 	}
 
-	resolver := &net.Resolver{}
-	mux, err := appctlcommon.NewClientMuxFromProfile(cfg.Profile, nil, nil, resolver, nil)
+	profile, flows, err := prepareNode(cfg.Profile)
+	if err != nil {
+		return nil, err
+	}
+	resolver := noLocalDNS{}
+	mux, err := appctlcommon.NewClientMuxFromProfile(profile, nil, nil, resolver, nil)
 	if err != nil {
 		return nil, fmt.Errorf("MSBOOST 核心启动失败：%w", err)
 	}
@@ -89,6 +97,7 @@ func Start(cfg *Config, listenPort int) (*Engine, error) {
 		server:   server,
 		listener: &countingListener{TCPListener: ln},
 		meter:    newTrafficMeter(nodeTraffic),
+		dnsFlows: flows,
 		user:     user,
 		password: password,
 		served:   make(chan struct{}),
@@ -105,6 +114,15 @@ func Start(cfg *Config, listenPort int) (*Engine, error) {
 		e.meter.run(started, t.C, e.stop)
 	}()
 	return e, nil
+}
+
+func (e *Engine) DNSFlows() []doh.Flow { return e.dnsFlows }
+
+// DialNode opens a stream to the Mieru server on the same transport used by
+// local SOCKS5 clients. The stream starts at the SOCKS5 request, after Mieru
+// authentication. It lets the checker await the real remote CONNECT reply.
+func (e *Engine) DialNode(ctx context.Context) (net.Conn, error) {
+	return e.mux.DialContext(ctx)
 }
 
 // Addr is the loopback SOCKS5 address.

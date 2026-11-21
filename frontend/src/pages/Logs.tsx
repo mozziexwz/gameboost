@@ -46,7 +46,7 @@ export function Logs(props: {lines: LogLine[]}) {
                 <button onClick={exportDiagnostics} disabled={exporting}>{exporting && <Spinner/>}导出诊断包…</button>
             </>}>
                 <p className="muted small">
-                    日志按天保存 7 天。日志和诊断包里有节点地址，只发给 MSBOOST 客服，不要公开发布。
+                    日志按天保存 7 天。诊断包包括代理地址和加速进程清单。
                 </p>
                 {message && <Banner kind={message.kind} onClose={() => setMessage(null)}>{message.text}</Banner>}
                 <div className="log-wrap">

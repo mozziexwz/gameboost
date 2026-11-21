@@ -21,7 +21,7 @@ export function Settings(props: {
 
     const cleanup = async () => {
         if (!await props.confirm('清理残留',
-            '将卸载分流驱动，并删除 MSBOOST 添加的防火墙规则和运行时文件。节点配置和设置不受影响。确定继续吗？', '清理', true)) {
+            '将卸载分流驱动，并删除此程序的防火墙规则和运行时文件。确定继续吗？', '清理', true)) {
             return
         }
         setCleaning(true)
@@ -38,7 +38,7 @@ export function Settings(props: {
     }
 
     const quit = async () => {
-        if (!idle && !await props.confirm('退出', '正在加速，退出会停止加速并断开游戏连接。确定退出吗？', '退出', true)) {
+        if (!idle && !await props.confirm('退出', '退出会停止加速并断开代理连接。确定退出吗？', '退出', true)) {
             return
         }
         await api.quit()
@@ -107,7 +107,7 @@ export function Settings(props: {
 function Licenses(props: {about: About, onClose: () => void}) {
     return (
         <Modal title="开源许可" wide onClose={props.onClose}>
-            <p>MSBOOST 启动器依据 GNU 通用公共许可证第 3 版（GPL-3.0）发布，使用了以下开源组件：</p>
+            <p>GAMEBOOST 依据 GNU 通用公共许可证第 3 版（GPL-3.0）发布。</p>
             <table className="components">
                 <thead>
                     <tr><th>组件</th><th>版本</th><th>版权</th><th>许可</th></tr>

@@ -10,21 +10,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	mlog "github.com/enfein/mieru/v3/pkg/log"
 
-	"github.com/mozziexwz/node_launcher/internal/engine"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/netenv"
-	"github.com/mozziexwz/node_launcher/internal/probe"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
-	"github.com/mozziexwz/node_launcher/internal/store"
-	"github.com/mozziexwz/node_launcher/internal/sysproxy"
+	"github.com/mozziexwz/gameboost/internal/doh"
+	"github.com/mozziexwz/gameboost/internal/engine"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/probe"
+	"github.com/mozziexwz/gameboost/internal/store"
+	"github.com/mozziexwz/gameboost/internal/sysproxy"
 )
 
 // CoreEngine is a running embedded core (internal/engine.Engine).
@@ -32,6 +31,7 @@ type CoreEngine interface {
 	Addr() *net.TCPAddr
 	Credential() (user, password string)
 	Stats() engine.Stats
+	DNSFlows() []doh.Flow
 	Close() error
 }
 
@@ -42,8 +42,8 @@ type Redirector interface {
 	Prepare()
 	AddSOCKS5(host string, port uint16, user, password string, sendDomain bool) (uint32, error)
 	DeleteProxy(id uint32) bool
-	// AddProxyRule proxies TCP and UDP of the listed processes to proxyID.
-	AddProxyRule(processes string, proxyID uint32) (uint32, error)
+	// AddProxyRule proxies TCP and UDP matching the process and host lists.
+	AddProxyRule(processes, hosts string, proxyID uint32) (uint32, error)
 	// AddTCPRule proxies the processes' TCP connections to the listed hosts
 	// and ports (";"-separated) to proxyID; EditTCPRule changes such a rule
 	// in place, keeping its position in the evaluation order.
@@ -94,10 +94,9 @@ type CheckFuncs struct {
 	ExitIP          func(ctx context.Context, p probe.Proxy) (string, error)
 	ResolveEntrance func(address string, timeout time.Duration) (ip, reason string)
 	Entrance        func(ip string, port, count int, timeout time.Duration) probe.Result
-	FullPath        func(p probe.Proxy, addr string, port int, opts probe.FullPathOptions) probe.Result
-	GameDNS         func(ctx context.Context) probe.DNSResult
-	// Hello is the UDP start's check that the tunnel reaches the node.
-	Hello func(p probe.Proxy, timeout time.Duration) error
+	WebLatency      func(ctx context.Context, p probe.Proxy, url string) probe.Result
+	NodeDNS         func(ctx context.Context, p probe.Proxy) error
+	ConfirmRelay    func(ctx context.Context, p probe.Proxy, addr string, port int) error
 }
 
 func (c *CheckFuncs) fillDefaults() {
@@ -110,29 +109,20 @@ func (c *CheckFuncs) fillDefaults() {
 	if c.Entrance == nil {
 		c.Entrance = probe.EntranceLatency
 	}
-	if c.FullPath == nil {
-		c.FullPath = probe.FullPathLatency
+	if c.WebLatency == nil {
+		c.WebLatency = probe.HTTPResponseLatency
 	}
-	if c.GameDNS == nil {
-		c.GameDNS = gameDNS
+	if c.NodeDNS == nil {
+		c.NodeDNS = func(ctx context.Context, p probe.Proxy) error {
+			resolver := doh.New(proxyDialer(p))
+			defer resolver.Close()
+			_, err := resolver.LookupIP(ctx, "ip4", "example.com")
+			return err
+		}
 	}
-	if c.Hello == nil {
-		c.Hello = probe.Hello
+	if c.ConfirmRelay == nil {
+		c.ConfirmRelay = probe.ConfirmRelay
 	}
-}
-
-// gameDNS resolves the game's host names through this computer's DNS, and
-// through public resolvers for comparison.
-func gameDNS(ctx context.Context) probe.DNSResult {
-	domains := profiles.GameDomains()
-	queries := make([]probe.DNSQuery, len(domains))
-	for i, d := range domains {
-		queries[i] = probe.DNSQuery{Host: d.Host, Purpose: d.Purpose}
-	}
-	r := probe.CheckDNS(ctx, queries, probe.SystemLookup, probe.PublicLookup)
-	snap, _ := netenv.Collect()
-	r.Servers = snap.DNSServers()
-	return r
 }
 
 // Deps wires the controller to real or fake implementations.
@@ -141,6 +131,8 @@ type Deps struct {
 	Log            *logx.Logger
 	StartEngine    func(*engine.Config) (CoreEngine, error)
 	LoadRedirector func() (Redirector, error) // called once, on first start
+	// StartDNS protects machine DNS while the acceleration session is active.
+	StartDNS func(probe.Proxy, []doh.Flow) (io.Closer, error)
 	// PrepareRuntime, when set, checks the redirector's files before every
 	// start and keeps them locked until release is called after the start.
 	PrepareRuntime func() (release func(), err error)
@@ -176,34 +168,37 @@ type Status struct {
 	UploadRate   int64 // bytes per second
 	DownloadRate int64
 	SystemProxy  []string // system proxy endpoints being taken over
-	Transport    string   // engine.TransportTCP or TransportUDP while accelerating
-	Addons       map[string]bool
+	Transport    string   // active transport to the node
 	LastError    string
 }
 
 // Errors the UI may want to distinguish.
 var (
-	ErrBusy       = errors.New("正在启动或停止，请稍后再试")
-	ErrRunning    = errors.New("加速进行中，请先停止加速")
-	ErrNotRunning = errors.New("当前没有在加速")
-	ErrNoConfig   = errors.New("请先选择节点配置")
+	ErrBusy        = errors.New("正在启动或停止，请稍后再试")
+	ErrRunning     = errors.New("加速进行中，请先停止加速")
+	ErrNotRunning  = errors.New("当前没有在加速")
+	ErrNoConfig    = errors.New("请先选择节点配置")
+	ErrNoProcesses = errors.New("请先添加并保存至少一个加速进程或文件夹")
+	ErrNoTargets   = errors.New("请先添加并保存至少一个目标 IP 或网段")
 )
 
-const gameRuleKey = "game"
+type connection struct {
+	proxy     probe.Proxy
+	entrance  probe.RelayTarget
+	transport string
+	eng       CoreEngine
+}
 
 type session struct {
 	config string
-	// cfg is the whole configuration file; the core runs on the bindings
-	// of transport only.
-	cfg       *engine.Config
-	transport string
-	eng       CoreEngine
-	proxyID   uint32
-	rules     map[string]uint32 // gameRuleKey, systemProxyRuleKey or addon ID -> rule id
-	since     time.Time
-	secrets   []string
+	connection
+	proxyID uint32
+	rules   []uint32
+	since   time.Time
+	secrets []string
 
 	takeover *proxyTakeover // nil when SystemProxies is not set
+	dns      io.Closer
 
 	diag      *connDiag
 	stopTrace func() // ends TraceConnections; only after the redirector stopped
@@ -257,7 +252,7 @@ func (c *Controller) Status() Status {
 }
 
 func (c *Controller) statusLocked() Status {
-	st := Status{State: c.state, Config: c.settings.CurrentConfig, LastError: c.lastErr, Addons: copySettings(c.settings).Addons}
+	st := Status{State: c.state, Config: c.settings.CurrentConfig, LastError: c.lastErr}
 	if c.session != nil {
 		st.Config = c.session.config
 		st.Transport = c.session.transport
@@ -302,13 +297,14 @@ func (c *Controller) emit() {
 
 // SelectConfig makes name (a file in configs\) the configuration to use.
 func (c *Controller) SelectConfig(name string) error {
-	if _, err := c.deps.Layout.LoadConfig(name); err != nil {
-		return err
-	}
 	c.mu.Lock()
 	if c.state != StateIdle {
 		c.mu.Unlock()
 		return ErrRunning
+	}
+	if _, err := c.deps.Layout.LoadConfig(name); err != nil {
+		c.mu.Unlock()
+		return err
 	}
 	next := copySettings(c.settings)
 	next.CurrentConfig = name
@@ -324,17 +320,86 @@ func (c *Controller) SelectConfig(name string) error {
 	return err
 }
 
-// SetProbeTarget changes the game endpoint used by the network check.
-func (c *Controller) SetProbeTarget(address string, port int) error {
+// SetMode selects which list is active, keeping both lists for the next start.
+func (c *Controller) SetMode(mode store.RouteMode) error {
 	c.mu.Lock()
-	next := copySettings(c.settings)
-	next.ProbeTarget = store.ProbeTarget{Address: address, Port: port}
-	err := c.deps.Layout.SaveSettings(next)
-	if err == nil {
-		c.settings = next
+	defer c.mu.Unlock()
+	if c.state != StateIdle {
+		return ErrRunning
 	}
-	c.mu.Unlock()
-	return err
+	next := copySettings(c.settings)
+	next.Mode = mode
+	if err := c.deps.Layout.SaveSettings(next); err != nil {
+		return err
+	}
+	c.settings = next
+	return nil
+}
+
+// SetTargets saves the destination IPs and CIDR networks for IP mode.
+func (c *Controller) SetTargets(values []string) error {
+	targets, err := store.NormalizeTargets(values)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != StateIdle {
+		return ErrRunning
+	}
+	next := copySettings(c.settings)
+	next.Targets = targets
+	if err := c.deps.Layout.SaveSettings(next); err != nil {
+		return err
+	}
+	c.settings = next
+	return nil
+}
+
+// SetProcesses replaces the list that will be used at the next start.
+func (c *Controller) SetProcesses(names []string) error {
+	processes := make([]string, 0, len(names))
+	seen := make(map[string]bool)
+	for _, name := range names {
+		name = strings.ReplaceAll(strings.TrimSpace(name), "/", "\\")
+		key := strings.ToLower(name)
+		if name != "" && !seen[key] {
+			processes = append(processes, name)
+			seen[key] = true
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != StateIdle {
+		return ErrRunning
+	}
+	next := copySettings(c.settings)
+	next.Processes = processes
+	if err := c.deps.Layout.SaveSettings(next); err != nil {
+		return err
+	}
+	c.settings = next
+	return nil
+}
+
+// SetProcessFolders saves the directories whose executables will be accelerated.
+func (c *Controller) SetProcessFolders(values []string) error {
+	folders, err := store.NormalizeProcessFolders(values)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != StateIdle {
+		return ErrRunning
+	}
+	next := copySettings(c.settings)
+	next.ProcessFolders = folders
+	if err := c.deps.Layout.SaveSettings(next); err != nil {
+		return err
+	}
+	c.settings = next
+	return nil
 }
 
 // SetTransport chooses TCP or UDP between the core and the node, for the next
@@ -373,64 +438,67 @@ func startTransport(cfg *engine.Config, chosen string) string {
 	return engine.TransportTCP
 }
 
-// startCore starts the core on the bindings of one transport of cfg.
-func (c *Controller) startCore(cfg *engine.Config, transport string) (CoreEngine, error) {
+// startConnection starts the core on the bindings of one transport of cfg.
+func (c *Controller) startConnection(cfg *engine.Config, transport string) (connection, error) {
 	run, err := cfg.ForTransport(transport)
 	if err != nil {
-		return nil, err
+		return connection{}, err
 	}
-	return c.deps.StartEngine(run)
+	eng, err := c.deps.StartEngine(run)
+	if err != nil {
+		return connection{}, err
+	}
+	user, password := eng.Credential()
+	proxy := probe.Proxy{Addr: eng.Addr().String(), User: user, Password: password}
+	if node, ok := eng.(interface {
+		DialNode(context.Context) (net.Conn, error)
+	}); ok {
+		proxy.DialNode = node.DialNode
+	}
+	return connection{proxy: proxy, entrance: probe.RelayTargetFromProfile(cfg.Profile), transport: transport, eng: eng}, nil
 }
 
-// udpCheckTimeout bounds the UDP start's hello, SOCKS5 included.
+// udpCheckTimeout bounds both ordinary UDP tunnel checks at startup.
 const udpCheckTimeout = 5 * time.Second
 
-// udpBlocked is the network check's reason when only TCP reaches the node.
-const udpBlocked = "经 UDP 连不上节点，可能是节点没有放行 UDP，或本机网络限制了 UDP；可改用 TCP"
+const exitTargetHost = "ip.sb"
 
-// SetAddon switches an optional acceleration. While accelerating, the rule
-// is added or removed immediately and applies to new connections.
-func (c *Controller) SetAddon(id string, on bool) error {
-	addon, ok := findAddon(id)
-	if !ok {
-		return fmt.Errorf("未知的可选加速项：%q", id)
+// ExitTargetURL is the fixed HTTPS endpoint for the exit latency check.
+const ExitTargetURL = "https://" + exitTargetHost + "/"
+
+func (c *Controller) verifyUDP(proxy probe.Proxy) error {
+	ctx, cancel := context.WithTimeout(context.Background(), udpCheckTimeout)
+	defer cancel()
+	targetCtx, cancelTarget := context.WithTimeout(ctx, udpCheckTimeout/2)
+	targetErr := c.deps.Checks.ConfirmRelay(targetCtx, proxy, exitTargetHost, 443)
+	cancelTarget()
+	if targetErr == nil {
+		return nil
 	}
-	c.mu.Lock()
-	defer func() {
-		c.mu.Unlock()
-		c.emit()
-	}()
-	if c.state == StateStarting || c.state == StateStopping {
-		return ErrBusy
+	// A slow target can outlive the preflight and never send a SOCKS reply.
+	// An ordinary HTTPS response independently verifies the same tunnel.
+	if _, err := c.deps.Checks.ExitIP(ctx, proxy); err != nil {
+		return fmt.Errorf("目标连接：%w；出口 IP：%w", targetErr, err)
 	}
-	next := copySettings(c.settings)
-	next.Addons[id] = on
-	if c.state == StateRunning {
-		rules := c.session.rules
-		if ruleID, present := rules[id]; on && !present {
-			newID, err := c.red.AddProxyRule(addon.ProcessList(), c.session.proxyID)
-			if err != nil {
-				return err
-			}
-			rules[id] = newID
-			c.log.Printf(logx.App, "已开启 %s 加速（对新连接生效）", addon.Name)
-		} else if !on && present {
-			c.red.DeleteRule(ruleID)
-			delete(rules, id)
-			c.log.Printf(logx.App, "已关闭 %s 加速（已建立的连接不受影响）", addon.Name)
-		}
-		if t := c.session.takeover; t != nil {
-			c.updateTakeoverLocked(t, proxiedProcesses(next))
-		}
-		if d := c.session.diag; d != nil {
-			d.setPrograms(proxiedProcesses(next))
-		}
-	}
-	if err := c.deps.Layout.SaveSettings(next); err != nil {
-		return err
-	}
-	c.settings = next
 	return nil
+}
+
+func (c *Controller) openConnection(cfg *engine.Config, chosenTransport string, verifyUDP bool) (connection, string, error) {
+	transport := startTransport(cfg, chosenTransport)
+	link, err := c.startConnection(cfg, transport)
+	if err != nil || !verifyUDP || transport != engine.TransportUDP {
+		return link, "", err
+	}
+	if err := c.verifyUDP(link.proxy); err != nil {
+		link.eng.Close()
+		if tcp, _ := cfg.Transports(); !tcp {
+			return connection{}, "", fmt.Errorf("UDP 连接检测未通过：%w", err)
+		}
+		c.log.Printf(logx.App, "UDP 连接检测未通过（%v），本次改用 TCP", err)
+		fallback, tcpErr := c.startConnection(cfg, engine.TransportTCP)
+		return fallback, "UDP 连接检测未通过，本次改用 TCP 加速", tcpErr
+	}
+	return link, "", nil
 }
 
 // Start begins acceleration. Warnings are non-fatal findings for the user.
@@ -487,7 +555,7 @@ func (c *Controller) startSession(s store.Settings) (sess *session, warnings []s
 
 	sys := c.deps.System
 	if !sys.Elevated() {
-		return nil, nil, errors.New("需要以管理员身份运行 MSBOOST 启动器")
+		return nil, nil, errors.New("需要以管理员身份运行 GAMEBOOST")
 	}
 	for _, conflict := range sys.Conflicts() {
 		if conflict.Blocking {
@@ -497,6 +565,13 @@ func (c *Controller) startSession(s store.Settings) (sess *session, warnings []s
 	}
 	if s.CurrentConfig == "" {
 		return nil, nil, ErrNoConfig
+	}
+	programs, hosts := s.RouteRule()
+	if programs == "" {
+		return nil, nil, ErrNoProcesses
+	}
+	if hosts == "" {
+		return nil, nil, ErrNoTargets
 	}
 	if err := c.waitForDriver(); err != nil {
 		return nil, nil, err
@@ -523,38 +598,31 @@ func (c *Controller) startSession(s store.Settings) (sess *session, warnings []s
 		}
 	}
 
-	transport := startTransport(cfg, s.Transport)
-	eng, err := c.startCore(cfg, transport)
+	link, warning, err := c.openConnection(cfg, s.Transport, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	// UDP is proven with a hello before any game traffic goes into it; a
-	// node, security group or network that drops UDP falls back to TCP.
-	if transport == engine.TransportUDP {
-		user, password := eng.Credential()
-		if err := c.deps.Checks.Hello(probe.Proxy{Addr: eng.Addr().String(), User: user, Password: password}, udpCheckTimeout); err != nil {
-			eng.Close()
-			c.log.Printf(logx.App, "UDP 连不上节点（%v），本次改用 TCP", err)
-			warnings = append(warnings, "UDP 连不上节点，本次改用 TCP 加速。可能是节点没有放行 UDP，或本机网络限制了 UDP")
-			transport = engine.TransportTCP
-			if eng, err = c.startCore(cfg, transport); err != nil {
-				return nil, nil, err
-			}
-		}
+	if warning != "" {
+		warnings = append(warnings, warning)
 	}
-	undo = append(undo, func() { eng.Close() })
-	user, password := eng.Credential()
+	undo = append(undo, func() { link.eng.Close() })
+	port := uint16(link.eng.Addr().Port)
+	c.log.Printf(logx.App, "mieru 客户端已启动（%s），本地端口 %d", strings.ToUpper(link.transport), port)
+	user, password := link.proxy.User, link.proxy.Password
 	for _, secret := range []string{user, password} {
+		if secret == "" {
+			continue
+		}
 		c.log.AddSecret(secret)
 		secrets = append(secrets, secret)
 	}
-	c.log.Printf(logx.App, "MSBOOST 核心已启动（%s），本地端口 %d", strings.ToUpper(transport), eng.Addr().Port)
 
 	diag := newConnDiag(c.log)
-	diag.setPrograms(proxiedProcesses(s))
-	diag.setProxy(eng.Addr().Port, "加速")
+	diag.setPrograms(programs)
+	diag.ipMode = s.Mode == store.ModeIP
+	diag.setProxy(int(port), "加速")
 	observed := false
-	if o, ok := eng.(observer); ok {
+	if o, ok := link.eng.(observer); ok {
 		o.Observe(diag.request)
 		observed = true
 	}
@@ -564,41 +632,35 @@ func (c *Controller) startSession(s store.Settings) (sess *session, warnings []s
 		return nil, nil, err
 	}
 	red.Prepare()
-	game := profiles.DefaultMapleStory()
-	proxyID, err := red.AddSOCKS5("127.0.0.1", uint16(eng.Addr().Port), user, password, game.SendDomainToProxy)
+	proxyID, err := red.AddSOCKS5("127.0.0.1", port, user, password, s.Mode == store.ModeProcess)
 	if err != nil {
 		return nil, nil, err
 	}
 	undo = append(undo, func() { red.DeleteProxy(proxyID) })
 
-	rules := make(map[string]uint32)
-	addRule := func(key, processes string) error {
-		id, err := red.AddProxyRule(processes, proxyID)
-		if err != nil {
-			return err
-		}
-		rules[key] = id
-		undo = append(undo, func() { red.DeleteRule(id) })
-		return nil
-	}
+	var rules []uint32
 	// The system-proxy rule must come first: rules match in order.
 	var takeover *proxyTakeover
-	if c.deps.SystemProxies != nil {
-		if takeover, err = c.startTakeover(red, eng, proxiedProcesses(s), &undo, &secrets); err != nil {
+	if s.Mode == store.ModeProcess && c.deps.SystemProxies != nil {
+		if takeover, err = c.startTakeover(red, link.proxy, programs, &undo, &secrets); err != nil {
 			return nil, nil, err
 		}
-		rules[systemProxyRuleKey] = takeover.ruleID
-		diag.setProxy(takeover.server.Addr().Port, "改由 MSBOOST 接管（系统代理）")
+		rules = append(rules, takeover.ruleID)
+		diag.setProxy(takeover.server.Addr().Port, "改由 GAMEBOOST 接管（系统代理）")
 	}
-	if err := addRule(gameRuleKey, game.ProcessList()); err != nil {
+	ruleID, err := red.AddProxyRule(programs, hosts, proxyID)
+	if err != nil {
 		return nil, nil, err
 	}
-	for _, addon := range profiles.Addons() {
-		if s.Addons[addon.ID] {
-			if err := addRule(addon.ID, addon.ProcessList()); err != nil {
-				return nil, nil, err
-			}
+	rules = append(rules, ruleID)
+	undo = append(undo, func() { red.DeleteRule(ruleID) })
+	var dns io.Closer
+	if c.deps.StartDNS != nil {
+		dns, err = c.deps.StartDNS(link.proxy, link.eng.DNSFlows())
+		if err != nil {
+			return nil, nil, fmt.Errorf("无法启用 DNS 防泄露：%w", err)
 		}
+		undo = append(undo, func() { dns.Close() })
 	}
 	stopTrace := red.TraceConnections(diag.decision)
 	undo = append(undo, stopTrace)
@@ -609,16 +671,18 @@ func (c *Controller) startSession(s store.Settings) (sess *session, warnings []s
 		return nil, nil, errors.New("分流启动失败，详细原因见日志")
 	}
 
-	if running := sys.RunningProcesses(game.Processes); len(running) > 0 {
-		warnings = append(warnings, "这些游戏进程在加速开始前已在运行："+strings.Join(running, "、")+"。已建立的连接不会被加速，请重启游戏")
+	if s.Mode == store.ModeProcess {
+		if running := sys.RunningProcesses(s.ProcessRules()); len(running) > 0 {
+			warnings = append(warnings, "这些进程在加速开始前已在运行："+strings.Join(running, "、")+"。请重启对应程序，让它重新建立连接")
+		}
 	}
-	c.log.Printf(logx.App, "加速已开始（节点配置 %s）", s.CurrentConfig)
+	c.log.Printf(logx.App, "加速已开始（配置 %s）", s.CurrentConfig)
 	for _, w := range warnings {
 		c.log.Printf(logx.App, "提醒：%s", w)
 	}
 	return &session{
-		config: s.CurrentConfig, cfg: cfg, transport: transport, eng: eng, proxyID: proxyID,
-		rules: rules, since: time.Now(), secrets: secrets, takeover: takeover,
+		config: s.CurrentConfig, connection: link, proxyID: proxyID,
+		rules: rules, since: time.Now(), secrets: secrets, takeover: takeover, dns: dns,
 		diag: diag, stopTrace: stopTrace, observed: observed,
 	}, warnings, nil
 }
@@ -710,17 +774,17 @@ func (c *Controller) Stop() error {
 	if sess.stopTrace != nil {
 		sess.stopTrace() // only now: the redirector no longer calls back
 	}
-	ids := make([]uint32, 0, len(sess.rules))
-	for _, id := range sess.rules {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] > ids[j] })
-	for _, id := range ids {
-		red.DeleteRule(id)
+	for i := len(sess.rules) - 1; i >= 0; i-- {
+		red.DeleteRule(sess.rules[i])
 	}
 	red.DeleteProxy(sess.proxyID)
 	if sess.takeover != nil {
 		c.stopTakeover(red, sess.takeover)
+	}
+	if sess.dns != nil {
+		if err := sess.dns.Close(); err != nil {
+			c.log.Printf(logx.App, "关闭 DNS 防泄露：%v", err)
+		}
 	}
 	if state, err := c.deps.System.StopDriver(); err != nil {
 		c.log.Printf(logx.App, "驱动未能卸载（%s）：%v。如果其他软件正在使用它，这是正常的", state, err)
@@ -732,11 +796,11 @@ func (c *Controller) Stop() error {
 	if sess.observed {
 		waitIdle(sess.eng, 2*time.Second)
 	}
+	c.log.Printf(logx.App, "本次已使用流量 %s", FormatBytes(stats.Upload+stats.Download))
 	for _, s := range sess.secrets {
 		c.log.RemoveSecret(s)
 	}
-	c.log.Printf(logx.App, "加速已停止，用时 %v；本次已使用流量 %s",
-		time.Since(started).Round(time.Millisecond), FormatBytes(stats.Upload+stats.Download))
+	c.log.Printf(logx.App, "加速已停止，用时 %v", time.Since(started).Round(time.Millisecond))
 	if sess.diag != nil {
 		sess.diag.finish()
 	}
@@ -766,10 +830,14 @@ func (c *Controller) Preflight() (elevated bool, conflicts []Conflict) {
 	return c.deps.System.Elevated(), c.deps.System.Conflicts()
 }
 
-// RunningGameProcesses lists game processes that are running now, so the UI
+// RunningProcesses lists configured processes that are running now, so the UI
 // can warn before stopping or starting acceleration.
-func (c *Controller) RunningGameProcesses() []string {
-	return c.deps.System.RunningProcesses(profiles.DefaultMapleStory().Processes)
+func (c *Controller) RunningProcesses() []string {
+	s := c.Settings()
+	if s.Mode == store.ModeIP {
+		return nil
+	}
+	return c.deps.System.RunningProcesses(s.ProcessRules())
 }
 
 // Cleanup removes what the launcher may leave on the system. It refuses to
@@ -807,68 +875,64 @@ func (c *Controller) FixConflict(fix string) ([]string, error) {
 	return report, err
 }
 
-// CheckResult holds the four independent network checks.
+// CheckResult holds independent observations of the node and the exit path.
 type CheckResult struct {
 	ExitIP         string
 	ExitIPError    string
 	EntranceTarget string // "ip:port" when one entrance could be chosen
 	Entrance       probe.Result
-	GameTarget     string
-	Game           probe.Result
-	DNS            probe.DNSResult
-	// Transport carried the full-path check; the entrance check is a TCP
-	// connect to the same port either way.
+	ExitTarget     string
+	Exit           probe.Result
+	DNSError       string
+	// Transport is the node transport or the selected IP proxy protocol.
 	Transport string
 }
 
-// Check runs the exit-IP lookup, the entrance TCP latency, the full-path game
-// latency and the game's DNS lookups. Each is independent: one failing never
-// suppresses another. While idle a temporary core is started for the check
-// (no elevation needed); the DNS lookups need no core and run alongside.
+// Check looks up the public exit IPv4, times the node's TCP entrance, and
+// measures the HTTPS response from ip.sb over the node. When idle it opens a temporary
+// engine, so the check does not require the redirector.
 func (c *Controller) Check(ctx context.Context) (CheckResult, error) {
 	c.mu.Lock()
 	state, sess, s := c.state, c.session, copySettings(c.settings)
 	c.mu.Unlock()
 
-	var cfg *engine.Config
-	var eng CoreEngine
-	var transport string
+	var link connection
 	switch state {
 	case StateRunning:
-		cfg, eng, transport = sess.cfg, sess.eng, sess.transport
+		link = sess.connection
 	case StateIdle:
 		if s.CurrentConfig == "" {
 			return CheckResult{}, ErrNoConfig
 		}
-		var err error
-		if cfg, err = c.deps.Layout.LoadConfig(s.CurrentConfig); err != nil {
+		cfg, err := c.deps.Layout.LoadConfig(s.CurrentConfig)
+		if err != nil {
 			return CheckResult{}, err
 		}
 		// Without a fallback: a UDP check that fails shows the user why.
-		transport = startTransport(cfg, s.Transport)
-		if eng, err = c.startCore(cfg, transport); err != nil {
+		link, _, err = c.openConnection(cfg, s.Transport, false)
+		if err != nil {
 			return CheckResult{}, err
 		}
-		defer eng.Close()
+		defer link.eng.Close()
 	default:
 		return CheckResult{}, ErrBusy
 	}
 
 	checks := c.deps.Checks
-	dns := make(chan probe.DNSResult, 1)
-	go func() { dns <- checks.GameDNS(ctx) }()
+	dnsResult := make(chan error, 1)
+	go func() { dnsResult <- checks.NodeDNS(ctx, link.proxy) }()
+	result := CheckResult{
+		ExitTarget: ExitTargetURL,
+		Transport:  link.transport,
+	}
 
-	user, password := eng.Credential()
-	proxy := probe.Proxy{Addr: eng.Addr().String(), User: user, Password: password}
-	result := CheckResult{GameTarget: fmt.Sprintf("%s:%d", s.ProbeTarget.Address, s.ProbeTarget.Port), Transport: transport}
-
-	if ip, err := checks.ExitIP(ctx, proxy); err != nil {
+	if ip, err := checks.ExitIP(ctx, link.proxy); err != nil {
 		result.ExitIPError = err.Error()
 	} else {
 		result.ExitIP = ip
 	}
 
-	target := probe.RelayTargetFromProfile(cfg.Profile)
+	target := link.entrance
 	switch {
 	case target.Err != "":
 		result.Entrance = probe.Unavailable(target.Err)
@@ -881,27 +945,13 @@ func (c *Controller) Check(ctx context.Context) (CheckResult, error) {
 		}
 	}
 
-	result.Game = checks.FullPath(proxy, s.ProbeTarget.Address, s.ProbeTarget.Port, probe.FullPathOptions{})
-	// Nothing came back through a UDP tunnel while the same port answers TCP:
-	// UDP is dropped on the way, the node's probe is not what is missing.
-	if transport == engine.TransportUDP && result.ExitIPError != "" && result.Game.SuccessCount == 0 && result.Entrance.SuccessCount > 0 {
-		result.ExitIPError = udpBlocked
-		result.Game = probe.Unavailable(udpBlocked)
+	result.Exit = checks.WebLatency(ctx, link.proxy, result.ExitTarget)
+	if err := <-dnsResult; err != nil {
+		result.DNSError = err.Error()
 	}
-	result.DNS = <-dns
-	dnsText := result.DNS.Compact()
-	if detail := result.DNS.Detail(); detail != "" {
-		dnsText += "：" + detail
-	}
-	c.log.Printf(logx.App, "网络检测（%s）：到游戏服务器 IPv4 %s；到中转 %s；到游戏 %s；本机 DNS %s", strings.ToUpper(transport),
-		orText(result.ExitIP, result.ExitIPError), result.Entrance.Compact(), result.Game.Compact(), dnsText)
+	c.log.Printf(logx.App, "出口检测（%s）：出口 IPv4 %s，入口 %s，目标 %s %s，节点 DNS %s", strings.ToUpper(link.transport),
+		orText(result.ExitIP, result.ExitIPError), result.Entrance.Compact(), result.ExitTarget, result.Exit.Compact(), orText(result.DNSError, "正常"))
 	return result, nil
-}
-
-// GameDNS checks whether this computer resolves the game's host names; the
-// support bundle runs it on its own.
-func (c *Controller) GameDNS(ctx context.Context) probe.DNSResult {
-	return c.deps.Checks.GameDNS(ctx)
 }
 
 func orText(value, fallback string) string {
@@ -911,20 +961,9 @@ func orText(value, fallback string) string {
 	return fallback
 }
 
-func findAddon(id string) (profiles.Addon, bool) {
-	for _, a := range profiles.Addons() {
-		if a.ID == id {
-			return a, true
-		}
-	}
-	return profiles.Addon{}, false
-}
-
 func copySettings(s store.Settings) store.Settings {
-	addons := make(map[string]bool, len(s.Addons))
-	for k, v := range s.Addons {
-		addons[k] = v
-	}
-	s.Addons = addons
+	s.Processes = append([]string{}, s.Processes...)
+	s.ProcessFolders = append([]string{}, s.ProcessFolders...)
+	s.Targets = append([]string{}, s.Targets...)
 	return s
 }

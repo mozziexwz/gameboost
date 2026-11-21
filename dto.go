@@ -4,27 +4,25 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mozziexwz/node_launcher/internal/app"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/probe"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
-	"github.com/mozziexwz/node_launcher/internal/store"
+	"github.com/mozziexwz/gameboost/internal/app"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/probe"
+	"github.com/mozziexwz/gameboost/internal/store"
 )
 
 // Values sent to the frontend. Times are Unix milliseconds; 0 means unset.
 
 type StatusDTO struct {
-	State        string          `json:"state"` // idle | starting | running | stopping
-	Config       string          `json:"config"`
-	SinceUnix    int64           `json:"sinceUnix"`
-	Upload       int64           `json:"upload"` // bytes exchanged with the node
-	Download     int64           `json:"download"`
-	UploadRate   int64           `json:"uploadRate"` // bytes per second
-	DownloadRate int64           `json:"downloadRate"`
-	SystemProxy  []string        `json:"systemProxy"` // system proxy endpoints taken over
-	Transport    string          `json:"transport"`   // tcp | udp while accelerating, else ""
-	LastError    string          `json:"lastError"`
-	Addons       map[string]bool `json:"addons"`
+	State        string   `json:"state"` // idle | starting | running | stopping
+	Config       string   `json:"config"`
+	SinceUnix    int64    `json:"sinceUnix"`
+	Upload       int64    `json:"upload"` // bytes exchanged with the node
+	Download     int64    `json:"download"`
+	UploadRate   int64    `json:"uploadRate"` // bytes per second
+	DownloadRate int64    `json:"downloadRate"`
+	SystemProxy  []string `json:"systemProxy"` // system proxy endpoints taken over
+	Transport    string   `json:"transport"`   // tcp | udp while accelerating
+	LastError    string   `json:"lastError"`
 }
 
 type ConfigDTO struct {
@@ -36,19 +34,6 @@ type ConfigDTO struct {
 	Current  bool   `json:"current"`
 }
 
-type AddonDTO struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Note      string   `json:"note"`
-	Processes []string `json:"processes"`
-	Enabled   bool     `json:"enabled"`
-}
-
-type GroupDTO struct {
-	Name      string   `json:"name"`
-	Processes []string `json:"processes"`
-}
-
 type ConflictDTO struct {
 	Message  string `json:"message"`
 	Blocking bool   `json:"blocking"`
@@ -56,19 +41,20 @@ type ConflictDTO struct {
 }
 
 type OverviewDTO struct {
-	Status        StatusDTO     `json:"status"`
-	Configs       []ConfigDTO   `json:"configs"`
-	Addons        []AddonDTO    `json:"addons"`
-	GameGroups    []GroupDTO    `json:"gameGroups"`
-	ProbeAddress  string        `json:"probeAddress"`
-	ProbePort     int           `json:"probePort"`
-	Transport     string        `json:"transport"` // the user's choice: tcp | udp
-	Elevated      bool          `json:"elevated"`
-	Conflicts     []ConflictDTO `json:"conflicts"`
-	LockError     string        `json:"lockError"`
-	SettingsError string        `json:"settingsError"`
-	DataDir       string        `json:"dataDir"`
-	Version       string        `json:"version"`
+	Status         StatusDTO     `json:"status"`
+	Configs        []ConfigDTO   `json:"configs"`
+	Mode           string        `json:"mode"`
+	Processes      []string      `json:"processes"`
+	ProcessFolders []string      `json:"processFolders"`
+	Targets        []string      `json:"targets"`
+	ExitTarget     string        `json:"exitTarget"`
+	Transport      string        `json:"transport"` // the user's choice: tcp | udp
+	Elevated       bool          `json:"elevated"`
+	Conflicts      []ConflictDTO `json:"conflicts"`
+	LockError      string        `json:"lockError"`
+	SettingsError  string        `json:"settingsError"`
+	DataDir        string        `json:"dataDir"`
+	Version        string        `json:"version"`
 }
 
 type ResultDTO struct {
@@ -83,19 +69,10 @@ type CheckDTO struct {
 	ExitIPError    string    `json:"exitIPError"`
 	EntranceTarget string    `json:"entranceTarget"`
 	Entrance       ResultDTO `json:"entrance"`
-	GameTarget     string    `json:"gameTarget"`
-	Game           ResultDTO `json:"game"`
-	DNS            DNSDTO    `json:"dns"`
-	Transport      string    `json:"transport"` // tcp | udp: what carried the game check
-}
-
-// DNSDTO is whether this computer resolves the game's host names.
-type DNSDTO struct {
-	OK      bool     `json:"ok"`
-	Text    string   `json:"text"`
-	Advice  string   `json:"advice"` // what to do when it fails, else ""
-	Servers []string `json:"servers"`
-	Failed  []string `json:"failed"` // "us-sso.nexon.io（游戏登录）超时"
+	ExitTarget     string    `json:"exitTarget"`
+	Exit           ResultDTO `json:"exit"`
+	DNSError       string    `json:"dnsError"`
+	Transport      string    `json:"transport"`
 }
 
 type ImportResultDTO struct {
@@ -136,7 +113,7 @@ func toStatusDTO(st app.Status) StatusDTO {
 		State: string(st.State), Config: st.Config,
 		Upload: st.Upload, Download: st.Download, UploadRate: st.UploadRate, DownloadRate: st.DownloadRate,
 		SystemProxy: st.SystemProxy, Transport: st.Transport,
-		LastError: st.LastError, Addons: st.Addons,
+		LastError: st.LastError,
 	}
 	if !st.Since.IsZero() {
 		dto.SinceUnix = st.Since.UnixMilli()
@@ -147,27 +124,11 @@ func toStatusDTO(st app.Status) StatusDTO {
 func toConfigDTOs(list []store.ConfigEntry, current string) []ConfigDTO {
 	out := make([]ConfigDTO, 0, len(list))
 	for _, c := range list {
-		dto := ConfigDTO{Name: c.Name, Profile: c.Profile, Entrance: c.Entrance, UDP: c.UDP, Current: c.Name == current}
+		dto := ConfigDTO{Name: c.Name, Profile: c.Profile, Entrance: c.Entrance, UDP: c.UDP, Current: strings.EqualFold(c.Name, current)}
 		if c.Err != nil {
 			dto.Error = c.Err.Error()
 		}
 		out = append(out, dto)
-	}
-	return out
-}
-
-func toAddonDTOs(enabled map[string]bool) []AddonDTO {
-	var out []AddonDTO
-	for _, a := range profiles.Addons() {
-		out = append(out, AddonDTO{ID: a.ID, Name: a.Name, Note: a.Note, Processes: a.Processes, Enabled: enabled[a.ID]})
-	}
-	return out
-}
-
-func toGroupDTOs() []GroupDTO {
-	var out []GroupDTO
-	for _, g := range profiles.DisplayGroups() {
-		out = append(out, GroupDTO{Name: g.Name, Processes: g.Processes})
 	}
 	return out
 }
@@ -197,21 +158,8 @@ func toCheckDTO(r app.CheckResult) CheckDTO {
 	return CheckDTO{
 		ExitIP: r.ExitIP, ExitIPError: r.ExitIPError,
 		EntranceTarget: r.EntranceTarget, Entrance: toResultDTO(r.Entrance),
-		GameTarget: r.GameTarget, Game: toResultDTO(r.Game),
-		DNS: toDNSDTO(r.DNS), Transport: r.Transport,
+		ExitTarget: r.ExitTarget, Exit: toResultDTO(r.Exit), DNSError: r.DNSError, Transport: r.Transport,
 	}
-}
-
-func toDNSDTO(r probe.DNSResult) DNSDTO {
-	failed := make([]string, 0, len(r.Lookups))
-	for _, l := range r.Failed() {
-		failed = append(failed, fmt.Sprintf("%s（%s）%s", l.Host, l.Purpose, l.Local.Err))
-	}
-	servers := r.Servers
-	if servers == nil {
-		servers = []string{}
-	}
-	return DNSDTO{OK: r.OK(), Text: r.Compact(), Advice: r.Advice(), Servers: servers, Failed: failed}
 }
 
 func toLogLineDTO(l logx.Line) LogLineDTO {

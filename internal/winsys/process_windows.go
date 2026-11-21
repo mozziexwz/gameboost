@@ -4,6 +4,8 @@
 package winsys
 
 import (
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -104,13 +106,27 @@ func ExitPrograms(names []string, title string, command uintptr, timeout time.Du
 	return exited, running, nil
 }
 
-// RunningMatches returns the running process image names that equal one of
-// names (case-insensitive). Wildcard entries are ignored.
+// RunningMatches returns image names matching an exact executable name, full
+// path, or recursive folder rule, ignoring case. Other wildcards are ignored.
 func RunningMatches(names []string) ([]string, error) {
 	want := make(map[string]bool, len(names))
+	paths := make(map[string]bool)
+	pathNames := make(map[string]bool)
+	var folderPrefixes []string
 	for _, n := range names {
-		if !strings.Contains(n, "*") {
-			want[strings.ToLower(n)] = true
+		n = strings.ToLower(n)
+		if prefix, ok := strings.CutSuffix(n, `\*`); ok && filepath.IsAbs(n) && !strings.Contains(prefix, "*") {
+			folderPrefixes = append(folderPrefixes, prefix+`\`)
+			continue
+		}
+		if strings.Contains(n, "*") {
+			continue
+		}
+		if filepath.IsAbs(n) {
+			paths[n] = true
+			pathNames[filepath.Base(n)] = true
+		} else {
+			want[n] = true
 		}
 	}
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
@@ -126,12 +142,37 @@ func RunningMatches(names []string) ([]string, error) {
 	for err = windows.Process32First(snap, &entry); err == nil; err = windows.Process32Next(snap, &entry) {
 		name := windows.UTF16ToString(entry.ExeFile[:])
 		key := strings.ToLower(name)
-		if want[key] && !seen[key] {
+		if seen[key] {
+			continue
+		}
+		matched := want[key]
+		if !matched && (pathNames[key] || len(folderPrefixes) > 0) {
+			imagePath := strings.ToLower(processImagePath(entry.ProcessID))
+			matched = paths[imagePath] || slices.ContainsFunc(folderPrefixes, func(prefix string) bool {
+				return strings.HasPrefix(imagePath, prefix)
+			})
+		}
+		if matched {
 			seen[key] = true
 			found = append(found, name)
 		}
 	}
 	return found, nil
+}
+
+func processImagePath(pid uint32) string {
+	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(process)
+	// A configured path fits in the redirector's 1024-byte process buffer.
+	var path [1024]uint16
+	size := uint32(len(path))
+	if err := windows.QueryFullProcessImageName(process, 0, &path[0], &size); err != nil {
+		return ""
+	}
+	return windows.UTF16ToString(path[:size])
 }
 
 // ProcessNames returns the image names of the running processes, each once.

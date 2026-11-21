@@ -1,7 +1,5 @@
-// Package probe implements the launcher's network checks: the exit IPv4 seen
-// through the local SOCKS5, TCP connect latency to the configured entrance, and
-// the full-path v2 probe against the node-side service on 127.0.0.1:20424
-// (contract: docs/MSBOOST全程TCP测速整改计划.md).
+// Package probe implements the launcher's network checks, including exit
+// IPv4 lookup, node TCP latency, and proxied HTTPS response latency.
 package probe
 
 import (
@@ -28,6 +26,7 @@ type Result struct {
 	TotalCount   int
 	Average      time.Duration
 	Errors       []string // unique failure reasons in first-seen order
+	fastest      bool
 }
 
 // NewResult aggregates samples; failed attempts never count as zero.
@@ -57,10 +56,22 @@ func Unavailable(reason string) Result {
 	return Result{TotalCount: DefaultSampleCount, Errors: []string{reason}}
 }
 
+func (r Result) displayLatency() time.Duration {
+	elapsed := r.Average
+	if r.fastest {
+		for _, s := range r.Samples {
+			if s.OK && s.Duration < elapsed {
+				elapsed = s.Duration
+			}
+		}
+	}
+	return elapsed
+}
+
 // Compact formats like the legacy launcher: "191 ms", "<1 ms" or "未测得：原因".
 func (r Result) Compact() string {
 	if r.SuccessCount > 0 {
-		ms := float64(r.Average) / float64(time.Millisecond)
+		ms := float64(r.displayLatency()) / float64(time.Millisecond)
 		if ms < 0.5 {
 			return "<1 ms"
 		}
@@ -75,7 +86,10 @@ func (r Result) Detail() string {
 	if r.SuccessCount == 0 {
 		return fmt.Sprintf("未测得（%s；%s）", counts, strings.Join(r.Errors, "、"))
 	}
-	ms := float64(r.Average) / float64(time.Millisecond)
+	if r.fastest {
+		counts = "取最快响应，" + counts
+	}
+	ms := float64(r.displayLatency()) / float64(time.Millisecond)
 	text := fmt.Sprintf("%.1f ms（%s）", ms, counts)
 	if ms < 0.05 {
 		text = fmt.Sprintf("<0.1 ms（%s）", counts)

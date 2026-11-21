@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mozziexwz/node_launcher/internal/engine"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
-	"github.com/mozziexwz/node_launcher/internal/sysproxy"
+	"github.com/mozziexwz/gameboost/internal/engine"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/profiles"
+	"github.com/mozziexwz/gameboost/internal/sysproxy"
 )
 
 // connLines returns the text of the log's connection records.
@@ -113,7 +113,6 @@ func TestConnDiagRequests(t *testing.T) {
 		{Command: "CONNECT", Host: "www.nexon.com", Port: 443, Domain: true, Up: 100, Down: 200}, // same target
 		{Command: "CONNECT", Host: "2600:9000:21e2::1", Port: 443, Up: 517, Down: 0, Elapsed: 30 * time.Second},
 		{Command: "CONNECT", Host: "54.238.121.146", Port: 8585, Up: 0, Down: 0, Elapsed: 500 * time.Millisecond},
-		{Command: "CONNECT", Host: "127.0.0.1", Port: 20424, Up: 100, Down: 100},     // network check
 		{Command: "CONNECT", Host: "api-ipv4.ip.sb", Port: 443, Domain: true, Up: 1}, // network check
 		{Command: "UDP", Host: "0.0.0.0", Port: 0},
 		{Command: ""}, // no handshake
@@ -212,7 +211,7 @@ func TestStartLogsEnvironmentAndWarnings(t *testing.T) {
 		"网络环境：Windows 11（版本 10.0.22631）；系统代理 关",
 		"网卡 WLAN（Wi-Fi）：IPv4 192.168.43.25",
 		"提醒：检测到 Netch 正在运行",
-		"提醒：这些游戏进程在加速开始前已在运行：nexon_launcher.exe",
+		"提醒：这些进程在加速开始前已在运行：nexon_launcher.exe",
 	} {
 		if !strings.Contains(logged, want) {
 			t.Fatalf("log lacks %q:\n%s", want, logged)
@@ -252,7 +251,7 @@ func TestStartFailureEndsTracing(t *testing.T) {
 	}
 }
 
-func TestObservedRequestsAndAddonsInTheLog(t *testing.T) {
+func TestObservedRequestsInTheLog(t *testing.T) {
 	h := newHarness(t, func(h *harness) { h.observe = true })
 	if _, err := h.c.Start(); err != nil {
 		t.Fatal(err)
@@ -260,27 +259,22 @@ func TestObservedRequestsAndAddonsInTheLog(t *testing.T) {
 	eng := h.observed[0]
 	eng.report(engine.Request{Command: "CONNECT", Host: "nxl.nxfs.nexon.com", Port: 443, Domain: true, Up: 900, Down: 4096, Elapsed: 3 * time.Second})
 
-	// Steam is not accelerated yet, so its connections are not recorded.
-	steam := ConnEvent{"steam.exe", "23.1.2.3", 443, "Direct"}
-	h.red.emit(steam)
-	if err := h.c.SetAddon("steam", true); err != nil {
-		t.Fatal(err)
-	}
-	h.red.emit(ConnEvent{"steam.exe", "23.1.2.3", 443, "Proxy SOCKS5://127.0.0.1:40000"})
+	h.red.emit(ConnEvent{"unlisted.exe", "23.1.2.3", 443, "Direct"})
+	h.red.emit(ConnEvent{"MapleStory.exe", "23.1.2.3", 443, "Proxy SOCKS5://127.0.0.1:40000"})
 	if err := h.c.Stop(); err != nil {
 		t.Fatal(err)
 	}
 	got := strings.Join(connLines(h.log), "\n")
 	for _, want := range []string{
 		"经节点 nxl.nxfs.nexon.com:443（域名）：上行 900 B，下行 4 KiB，用时 3 秒",
-		"steam.exe → 23.1.2.3:443 TCP，加速",
+		"MapleStory.exe → 23.1.2.3:443 TCP，加速",
 		"经节点的连接 1 条（域名 1、IPv4 地址 0、IPv6 地址 0），其中 0 条没有收到回应",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("log lacks %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "steam.exe → 23.1.2.3:443 TCP，直连") {
-		t.Fatalf("steam's connection before the switch was recorded:\n%s", got)
+	if strings.Contains(got, "unlisted.exe → 23.1.2.3:443 TCP，直连") {
+		t.Fatalf("unlisted connection was recorded:\n%s", got)
 	}
 }

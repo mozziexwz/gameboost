@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mozziexwz/node_launcher/internal/engine"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/probe"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
-	"github.com/mozziexwz/node_launcher/internal/sysproxy"
+	"github.com/mozziexwz/gameboost/internal/engine"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/probe"
+	"github.com/mozziexwz/gameboost/internal/profiles"
+	"github.com/mozziexwz/gameboost/internal/sysproxy"
 )
 
 // Connection records for support cases, which are solved from exported logs.
@@ -46,12 +46,14 @@ type connStats struct {
 }
 
 type connDiag struct {
-	log *logx.Logger
+	log    *logx.Logger
+	ipMode bool // only log proxied decisions when matching destinations
 
 	mu        sync.Mutex
 	closed    bool
 	exact     map[string]bool // lower-case image names of the accelerated programs
 	patterned map[string]bool // image names of path patterns, e.g. cefhelper.exe
+	folders   bool            // proxied decisions from recursive folder rules
 	proxies   map[int]string  // local proxy port -> what it stands for
 	decisions map[string]bool
 	targets   map[string]bool
@@ -71,14 +73,18 @@ func newConnDiag(log *logx.Logger) *connDiag {
 	}
 }
 
-// setPrograms takes the ";"-separated list of accelerated programs. Path
-// patterns such as *\ToyWebView\cefhelper.exe are known only by their image
-// name here, so for them only accelerated connections are written.
+// setPrograms takes the ";"-separated process rules. The redirector reports
+// only the executable name, so path rules rely on its proxy decision.
 func (d *connDiag) setPrograms(list string) {
 	exact, patterned := map[string]bool{}, map[string]bool{}
+	folders := false
 	for _, p := range strings.Split(list, ";") {
 		name := strings.ToLower(strings.TrimSpace(p))
 		if name == "" {
+			continue
+		}
+		if strings.HasSuffix(name, `\*`) {
+			folders = true
 			continue
 		}
 		if strings.ContainsAny(name, `*\/`) {
@@ -93,7 +99,7 @@ func (d *connDiag) setPrograms(list string) {
 		exact[name] = true
 	}
 	d.mu.Lock()
-	d.exact, d.patterned = exact, patterned
+	d.exact, d.patterned, d.folders = exact, patterned, folders
 	d.mu.Unlock()
 }
 
@@ -110,7 +116,8 @@ func (d *connDiag) decision(ev ConnEvent) {
 	accelerated := strings.HasPrefix(ev.Info, "Proxy")
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed || !(d.exact[name] || accelerated && d.patterned[name]) {
+	matches := d.exact[name] || accelerated && (d.ipMode || d.patterned[name] || d.folders)
+	if d.closed || !matches {
 		return
 	}
 	key := name + "|" + ev.DestIP + "|" + strconv.Itoa(int(ev.Port)) + "|" + ev.Info
@@ -260,8 +267,7 @@ var exitIPHost = func() string {
 
 // isCheckTarget reports the network check's own requests.
 func isCheckTarget(r engine.Request) bool {
-	return r.Host == "127.0.0.1" && r.Port == probe.FullPathProbePort ||
-		exitIPHost != "" && r.Host == exitIPHost
+	return exitIPHost != "" && r.Host == exitIPHost
 }
 
 func formatElapsed(d time.Duration) string {

@@ -3,10 +3,11 @@
 //	configs\       node configurations downloaded from the website (*.json)
 //	logs\          daily log files
 //	data\          UI cache (WebView2)
-//	settings.json  current config, probe target, addon switches
+//	settings.json  selected node, transport, and routing rules
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +16,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mozziexwz/node_launcher/internal/engine"
-	"github.com/mozziexwz/node_launcher/internal/probe"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
+	"github.com/mozziexwz/gameboost/internal/engine"
+	"github.com/mozziexwz/gameboost/internal/probe"
+	"github.com/mozziexwz/gameboost/internal/profiles"
 )
 
 // Layout locates the portable data folders.
@@ -64,54 +65,54 @@ func (l Layout) Ensure() error {
 
 // ---- settings ----
 
-const settingsVersion = 1
-
-// ProbeTarget is the game endpoint used by the full-path probe.
-type ProbeTarget struct {
-	Address string `json:"address"`
-	Port    int    `json:"port"`
-}
+const settingsVersion = 3
 
 // Settings is persisted in settings.json.
 type Settings struct {
-	Version       int             `json:"version"`
-	CurrentConfig string          `json:"currentConfig"`
-	ProbeTarget   ProbeTarget     `json:"probeTarget"`
-	Addons        map[string]bool `json:"addons"`
+	Version        int       `json:"version"`
+	CurrentConfig  string    `json:"currentConfig"`
+	Mode           RouteMode `json:"mode"`
+	Processes      []string  `json:"processes"`
+	ProcessFolders []string  `json:"processFolders"`
+	Targets        []string  `json:"targets"`
 	// Transport is the user's choice, engine.TransportTCP or TransportUDP;
 	// empty means TCP. UDP applies only to a configuration with a UDP binding.
 	Transport string `json:"transport,omitempty"`
 }
 
-// DefaultSettings uses the default game's probe target and all addons off.
+// DefaultSettings starts in process mode with an empty rule list.
 func DefaultSettings() Settings {
-	game := profiles.DefaultMapleStory()
-	s := Settings{
-		Version:     settingsVersion,
-		ProbeTarget: ProbeTarget{Address: game.TestAddress, Port: game.TestPort},
-		Addons:      make(map[string]bool),
+	return Settings{
+		Version:        settingsVersion,
+		Mode:           ModeProcess,
+		Processes:      []string{},
+		ProcessFolders: []string{},
+		Targets:        []string{},
 	}
-	for _, a := range profiles.Addons() {
-		s.Addons[a.ID] = false
-	}
-	return s
 }
 
 // Validate checks values a user can edit.
 func (s Settings) Validate() error {
-	game := profiles.DefaultMapleStory()
-	game.TestAddress, game.TestPort = s.ProbeTarget.Address, s.ProbeTarget.Port
-	if err := game.Validate(); err != nil {
+	for _, name := range s.Processes {
+		if err := profiles.ValidateProcessName(name); err != nil {
+			return err
+		}
+	}
+	folders, err := NormalizeProcessFolders(s.ProcessFolders)
+	if err != nil {
 		return err
 	}
-	known := make(map[string]bool)
-	for _, a := range profiles.Addons() {
-		known[a.ID] = true
+	s.ProcessFolders = folders
+	// The native redirector stores each rule's combined process list in a
+	// 1024-byte buffer, including the trailing NUL.
+	if len(strings.Join(s.ProcessRules(), ";")) >= 1024 {
+		return errors.New("加速进程和文件夹清单过长，请缩短路径或减少条目")
 	}
-	for id := range s.Addons {
-		if !known[id] {
-			return fmt.Errorf("未知的可选加速项：%q", id)
-		}
+	if s.Mode != ModeProcess && s.Mode != ModeIP {
+		return fmt.Errorf("未知的代理模式：%q", s.Mode)
+	}
+	if _, _, err := parseTargets(s.Targets); err != nil {
+		return err
 	}
 	if s.CurrentConfig != "" {
 		if err := validConfigName(s.CurrentConfig); err != nil {
@@ -142,17 +143,13 @@ func (l Layout) LoadSettings() (Settings, error) {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return defaults, fmt.Errorf("设置文件已损坏，已使用默认设置：%w", err)
 	}
-	if s.Addons == nil {
-		s.Addons = defaults.Addons
-	}
-	for id := range defaults.Addons {
-		if _, ok := s.Addons[id]; !ok {
-			s.Addons[id] = false
-		}
+	if s.Version == 1 {
+		s.Processes = profiles.DefaultMapleStory().Processes
 	}
 	if err := s.Validate(); err != nil {
 		return defaults, fmt.Errorf("设置无效，已使用默认设置：%w", err)
 	}
+	s.ProcessFolders, _ = NormalizeProcessFolders(s.ProcessFolders)
 	s.Version = settingsVersion
 	return s, nil
 }
@@ -162,6 +159,8 @@ func (l Layout) SaveSettings(s Settings) error {
 	if err := s.Validate(); err != nil {
 		return err
 	}
+	s.ProcessFolders, _ = NormalizeProcessFolders(s.ProcessFolders)
+	s.Targets, _ = NormalizeTargets(s.Targets)
 	s.Version = settingsVersion
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
@@ -206,7 +205,7 @@ func (l Layout) ListConfigs() ([]ConfigEntry, error) {
 	return entries, nil
 }
 
-// LoadConfig parses a configuration from configs\ by file name.
+// LoadConfig reads a mieru node from configs\ by file name.
 func (l Layout) LoadConfig(name string) (*engine.Config, error) {
 	path, err := l.ConfigPath(name)
 	if err != nil {
@@ -235,14 +234,46 @@ func (l Layout) ImportConfig(src string, overwrite bool) (ConfigEntry, error) {
 	if err != nil {
 		return ConfigEntry{}, fmt.Errorf("读取配置文件失败：%w", err)
 	}
-	if _, err := engine.ParseConfig(b); err != nil {
+	cfg, err := engine.ParseConfig(b)
+	if err != nil {
 		return ConfigEntry{}, err
 	}
 	if same, err := sameAbsPath(src, dst); err == nil && same {
-		return describeConfig(name, dst), nil
+		return configEntry(name, dst, cfg), nil
 	}
-	if existing, err := os.ReadFile(dst); err == nil && !overwrite && string(existing) != string(b) {
-		return ConfigEntry{}, fmt.Errorf("%w：%s", ErrConfigExists, name)
+	return l.saveConfig(name, dst, b, cfg, overwrite)
+}
+
+// ImportLink converts a share link to the same portable JSON used by file import.
+func (l Layout) ImportLink(name, link string, overwrite bool) (ConfigEntry, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ConfigEntry{}, errors.New("请填写节点配置名称")
+	}
+	if !strings.EqualFold(filepath.Ext(name), ".json") {
+		name += ".json"
+	}
+	dst, err := l.ConfigPath(name)
+	if err != nil {
+		return ConfigEntry{}, err
+	}
+	cfg, b, err := engine.ParseConfigLink(link)
+	if err != nil {
+		return ConfigEntry{}, err
+	}
+	return l.saveConfig(name, dst, b, cfg, overwrite)
+}
+
+func (l Layout) saveConfig(name, dst string, b []byte, cfg *engine.Config, overwrite bool) (ConfigEntry, error) {
+	if existing, err := os.ReadFile(dst); err == nil {
+		if bytes.Equal(existing, b) {
+			return configEntry(name, dst, cfg), nil
+		}
+		if !overwrite {
+			return ConfigEntry{Name: name}, ErrConfigExists
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ConfigEntry{}, err
 	}
 	if err := os.MkdirAll(l.Configs, 0o755); err != nil {
 		return ConfigEntry{}, err
@@ -250,7 +281,7 @@ func (l Layout) ImportConfig(src string, overwrite bool) (ConfigEntry, error) {
 	if err := writeFileAtomic(dst, b); err != nil {
 		return ConfigEntry{}, err
 	}
-	return describeConfig(name, dst), nil
+	return configEntry(name, dst, cfg), nil
 }
 
 // DeleteConfig removes a configuration file from configs\.
@@ -317,12 +348,15 @@ func legacyCurrentConfig(dir string) string {
 }
 
 func describeConfig(name, path string) ConfigEntry {
-	entry := ConfigEntry{Name: name, Path: path}
 	cfg, err := engine.LoadConfigFile(path)
 	if err != nil {
-		entry.Err = err
-		return entry
+		return ConfigEntry{Name: name, Path: path, Err: err}
 	}
+	return configEntry(name, path, cfg)
+}
+
+func configEntry(name, path string, cfg *engine.Config) ConfigEntry {
+	entry := ConfigEntry{Name: name, Path: path}
 	entry.Profile = cfg.Profile.GetProfileName()
 	_, entry.UDP = cfg.Transports()
 	if t := probe.RelayTargetFromProfile(cfg.Profile); t.Err == "" {
@@ -334,7 +368,7 @@ func describeConfig(name, path string) ConfigEntry {
 }
 
 func validConfigName(name string) error {
-	if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `\/:*?"<>|`) ||
+	if !filepath.IsLocal(name) || name != filepath.Base(name) || strings.ContainsAny(name, "\\/:*?\"<>|\x00\r\n\t") ||
 		strings.HasPrefix(name, ".") || !strings.EqualFold(filepath.Ext(name), ".json") {
 		return fmt.Errorf("配置文件名无效：%q", name)
 	}

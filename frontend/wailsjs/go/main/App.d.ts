@@ -16,6 +16,8 @@ export function HideToTray():Promise<void>;
 
 export function ImportConfig(arg1:string,arg2:boolean):Promise<main.ImportResultDTO>;
 
+export function ImportLink(arg1:string,arg2:string,arg3:boolean):Promise<main.ImportResultDTO>;
+
 export function OpenFolder(arg1:string):Promise<void>;
 
 export function OpenURL(arg1:string):Promise<void>;
@@ -24,21 +26,27 @@ export function Overview():Promise<main.OverviewDTO>;
 
 export function PickConfigFile():Promise<string>;
 
+export function PickProcessFiles():Promise<Array<string>>;
+
+export function PickProcessFolder():Promise<string>;
+
 export function Quit():Promise<void>;
 
 export function RecentLogs():Promise<Array<main.LogLineDTO>>;
 
-export function ResetProbeTarget():Promise<void>;
-
 export function RunCheck():Promise<main.CheckDTO>;
 
-export function RunningGameProcesses():Promise<Array<string>>;
+export function RunningProcesses():Promise<Array<string>>;
 
 export function SelectConfig(arg1:string):Promise<void>;
 
-export function SetAddon(arg1:string,arg2:boolean):Promise<void>;
+export function SetMode(arg1:string):Promise<void>;
 
-export function SetProbeTarget(arg1:string,arg2:number):Promise<void>;
+export function SetProcessFolders(arg1:Array<string>):Promise<Array<string>>;
+
+export function SetProcesses(arg1:Array<string>):Promise<Array<string>>;
+
+export function SetTargets(arg1:Array<string>):Promise<Array<string>>;
 
 export function SetTransport(arg1:string):Promise<void>;
 

@@ -5,6 +5,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -12,22 +13,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mozziexwz/node_launcher/internal/engine"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/netenv"
-	"github.com/mozziexwz/node_launcher/internal/redirector"
-	"github.com/mozziexwz/node_launcher/internal/store"
-	"github.com/mozziexwz/node_launcher/internal/sysproxy"
-	"github.com/mozziexwz/node_launcher/internal/winsys"
+	"github.com/mozziexwz/gameboost/internal/dnsroute"
+	"github.com/mozziexwz/gameboost/internal/doh"
+	"github.com/mozziexwz/gameboost/internal/engine"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/netenv"
+	"github.com/mozziexwz/gameboost/internal/probe"
+	"github.com/mozziexwz/gameboost/internal/redirector"
+	"github.com/mozziexwz/gameboost/internal/store"
+	"github.com/mozziexwz/gameboost/internal/sysproxy"
+	"github.com/mozziexwz/gameboost/internal/winsys"
 )
 
-// Redirector lines shown in Chinese: those that name the redirector (the UI
-// only says MSBOOST) and the impostor bridge's notices (patch P5).
+// Redirector lines shown in Chinese, including the compatibility notices.
 var redirectorMessages = map[string]string{
 	"ProxyBridge started": "分流核心已启动",
 	"ProxyBridge stopped": "分流核心已停止",
 	"Bridge: another network driver re-sends packets, handing them back":  "检测到本机有其他网络驱动转发数据包，已自动兼容",
-	"Bridge: a packet came back from the other driver, bridge turned off": "数据包在 MSBOOST 和其他网络驱动之间来回转发，已关闭自动兼容；如果加速无效，请导出诊断包联系客服",
+	"Bridge: a packet came back from the other driver, bridge turned off": "数据包在 GAMEBOOST 和其他网络驱动之间来回转发，已关闭自动兼容",
 }
 
 func brandRedirectorLine(line string) string {
@@ -60,9 +63,22 @@ func NewWindows(layout store.Layout, log *logx.Logger, corePath string, prepareR
 			return coreAdapter{core}, nil
 		},
 		PrepareRuntime: prepareRuntime,
-		SystemProxies:  sysproxy.Current,
-		Environment:    EnvironmentLines,
-		System:         windowsSystem{},
+		StartDNS: func(p probe.Proxy, bypass []doh.Flow) (io.Closer, error) {
+			network, err := netenv.Collect()
+			if err != nil {
+				return nil, err
+			}
+			logf := func(format string, args ...any) { log.Printf(logx.App, format, args...) }
+			s, err := dnsroute.Start(filepath.Join(filepath.Dir(corePath), "WinDivert.dll"), network.DNSServers(), bypass, proxyDialer(p), logf)
+			if err != nil {
+				return nil, err
+			}
+			logf("DNS 防泄露已启用，DNS 经当前节点转发")
+			return s, nil
+		},
+		SystemProxies: sysproxy.Current,
+		Environment:   EnvironmentLines,
+		System:        windowsSystem{},
 	})
 }
 
@@ -80,8 +96,8 @@ func (a coreAdapter) AddSOCKS5(host string, port uint16, user, password string, 
 
 func (a coreAdapter) DeleteProxy(id uint32) bool { return a.core.DeleteProxyConfig(id) }
 
-func (a coreAdapter) AddProxyRule(processes string, proxyID uint32) (uint32, error) {
-	return a.core.AddRule(processes, "*", "*", "*", redirector.ProtocolBoth, redirector.ActionProxy, proxyID)
+func (a coreAdapter) AddProxyRule(processes, hosts string, proxyID uint32) (uint32, error) {
+	return a.core.AddRule(processes, hosts, "*", "*", redirector.ProtocolBoth, redirector.ActionProxy, proxyID)
 }
 
 func (a coreAdapter) AddTCPRule(processes, hosts, ports string, proxyID uint32) (uint32, error) {
@@ -235,24 +251,20 @@ func (windowsSystem) Cleanup(exePath string) []string {
 	default:
 		report = append(report, "驱动状态："+state)
 	}
-	// Our patched core names its rule "MSBOOST relay <path hash>"; a portable
-	// copy moved between folders leaves one rule per folder, so remove them
-	// all. The official core's name is only removed for this executable.
-	removed, err := winsys.DeleteFirewallRulesWithPrefix(redirector.RulePrefixPatched + " ")
-	if err != nil {
-		report = append(report, err.Error())
+	// The patched naming prefix is shared with node_launcher. Clean up the
+	// rules for this executable path only.
+	reportedRule := false
+	for _, name := range redirector.FirewallRuleNames(exePath) {
+		deleted, err := winsys.DeleteFirewallRule(name)
+		if err != nil {
+			report = append(report, err.Error())
+			reportedRule = true
+		} else if deleted {
+			report = append(report, "已删除防火墙规则 "+name)
+			reportedRule = true
+		}
 	}
-	for _, name := range removed {
-		report = append(report, "已删除防火墙规则 "+name)
-	}
-	official := redirector.FirewallRuleNames(exePath)[1]
-	deleted, officialErr := winsys.DeleteFirewallRule(official)
-	if officialErr != nil {
-		report = append(report, officialErr.Error())
-	} else if deleted {
-		report = append(report, "已删除防火墙规则 "+official)
-	}
-	if err == nil && officialErr == nil && len(removed) == 0 && !deleted {
+	if !reportedRule {
 		report = append(report, "没有残留的防火墙规则")
 	}
 	dir := winsys.ProgramDataDir()

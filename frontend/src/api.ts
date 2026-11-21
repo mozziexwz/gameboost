@@ -7,6 +7,7 @@ export type State = 'idle' | 'starting' | 'running' | 'stopping'
 
 // How the core reaches the node. UDP needs a configuration with a UDP binding.
 export type Transport = 'tcp' | 'udp'
+export type RouteMode = 'process' | 'ip'
 
 export interface Status {
     state: State
@@ -17,9 +18,8 @@ export interface Status {
     uploadRate: number // bytes per second
     downloadRate: number
     systemProxy: string[] | null // system proxy endpoints being taken over
-    transport: Transport | '' // in use while accelerating, else ''
+    transport: Transport | '' // in use while accelerating
     lastError: string
-    addons: Record<string, boolean>
 }
 
 export interface ConfigItem {
@@ -31,19 +31,6 @@ export interface ConfigItem {
     current: boolean
 }
 
-export interface Addon {
-    id: string
-    name: string
-    note: string
-    processes: string[]
-    enabled: boolean
-}
-
-export interface Group {
-    name: string
-    processes: string[]
-}
-
 export interface Conflict {
     message: string
     blocking: boolean
@@ -53,10 +40,11 @@ export interface Conflict {
 export interface Overview {
     status: Status
     configs: ConfigItem[]
-    addons: Addon[]
-    gameGroups: Group[]
-    probeAddress: string
-    probePort: number
+    mode: RouteMode
+    processes: string[]
+    processFolders: string[] | null
+    targets: string[]
+    exitTarget: string
     transport: Transport // the user's choice
     elevated: boolean
     conflicts: Conflict[]
@@ -78,18 +66,10 @@ export interface Check {
     exitIPError: string
     entranceTarget: string
     entrance: Result
-    gameTarget: string
-    game: Result
-    dns: DNSCheck
-    transport: Transport // what carried the game check
-}
-
-export interface DNSCheck {
-    ok: boolean
-    text: string
-    advice: string
-    servers: string[]
-    failed: string[]
+    exitTarget: string
+    exit: Result
+    dnsError: string
+    transport: Transport
 }
 
 export interface LogLine {
@@ -131,17 +111,22 @@ export const api = {
     overview: async () => plain<Overview>(await Go.Overview()),
     start: async () => (await Go.Start()) ?? [],
     stop: () => Go.Stop(),
-    runningGame: async () => (await Go.RunningGameProcesses()) ?? [],
+    runningProcesses: async () => (await Go.RunningProcesses()) ?? [],
+    pickProcessFiles: async () => (await Go.PickProcessFiles()) ?? [],
+    pickProcessFolder: () => Go.PickProcessFolder(),
+    setProcesses: (names: string[]) => Go.SetProcesses(names),
+    setProcessFolders: async (paths: string[]) => (await Go.SetProcessFolders(paths)) ?? [],
+    setMode: (mode: RouteMode) => Go.SetMode(mode),
+    setTargets: (targets: string[]) => Go.SetTargets(targets),
     selectConfig: (name: string) => Go.SelectConfig(name),
     pickConfigFile: () => Go.PickConfigFile(),
     importConfig: async (path: string, overwrite: boolean) =>
         plain<{name: string, exists: boolean}>(await Go.ImportConfig(path, overwrite)),
+    importLink: async (name: string, link: string, overwrite: boolean) =>
+        plain<{name: string, exists: boolean}>(await Go.ImportLink(name, link, overwrite)),
     deleteConfig: (name: string) => Go.DeleteConfig(name),
     openFolder: (kind: 'configs' | 'logs' | 'data') => Go.OpenFolder(kind),
-    setAddon: (id: string, on: boolean) => Go.SetAddon(id, on),
-    setProbeTarget: (address: string, port: number) => Go.SetProbeTarget(address, port),
     setTransport: (transport: Transport) => Go.SetTransport(transport),
-    resetProbeTarget: () => Go.ResetProbeTarget(),
     runCheck: async () => plain<Check>(await Go.RunCheck()),
     recentLogs: async () => plain<LogLine[]>(await Go.RecentLogs()) ?? [],
     exportDiagnostics: () => Go.ExportDiagnostics(),

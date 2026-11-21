@@ -56,7 +56,7 @@ func Conflicts(in ConflictInputs) []Conflict {
 	var out []Conflict
 	if in.ProxyBridgeServiceState == "RUNNING" || in.ProxyBridgeServiceState == "START_PENDING" {
 		out = append(out, Conflict{
-			Message:  "检测到 ProxyBridge 的后台服务正在运行，它会和 MSBOOST 抢用分流驱动，需要先停止",
+			Message:  "检测到 ProxyBridge 的后台服务正在运行，请先停止该服务以释放分流驱动",
 			Blocking: true,
 			Fix:      FixProxyBridge,
 		})
@@ -86,7 +86,7 @@ func IsElevated() bool {
 }
 
 // ErrAlreadyRunning means another launcher instance holds the lock.
-var ErrAlreadyRunning = errors.New("另一个 MSBOOST 启动器正在运行")
+var ErrAlreadyRunning = errors.New("另一个启动器正在使用分流核心")
 
 // AcquireInstance takes a per-session named mutex so that only one launcher
 // (window or command line) drives the core at a time.
@@ -161,7 +161,7 @@ func parseRuleNames(output, prefix string) (names []string, rest string) {
 	return names, strings.Join(other, " ")
 }
 
-// ProgramDataDir is %ProgramData%\MSBOOST, where released runtime files live.
+// ProgramDataDir is %ProgramData%\GAMEBOOST, where released runtime files live.
 // The path comes from the known-folder registry, not the ProgramData
 // environment variable, which the user can redefine for elevated processes.
 func ProgramDataDir() string {
@@ -169,5 +169,5 @@ func ProgramDataDir() string {
 	if err != nil || base == "" {
 		base = `C:\ProgramData`
 	}
-	return filepath.Join(base, "MSBOOST")
+	return filepath.Join(base, "GAMEBOOST")
 }

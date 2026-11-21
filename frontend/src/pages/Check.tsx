@@ -33,47 +33,42 @@ export function CheckPage(props: {overview: Overview, check: CheckState}) {
     const r = c.result
     const hasCurrent = o.configs.some(x => x.current && !x.error)
     const pending = <span className="none">{c.running ? '检测中…' : '—'}</span>
-
     return (
         <div className="page">
-            <Card title="网络检测" actions={
+            <Card title="出口检测" actions={
                 <button className="primary" onClick={c.run} disabled={!canCheck(o, c)}>
                     {c.running && <Spinner/>}{checkLabel(c)}
                 </button>
             }>
                 <p className="muted small">
-                    查询连接到游戏服务器的 IPv4，并检测到中转服务器及到游戏服务器的延迟。游戏测速目标可在“游戏与加速项”中修改。
+                    通过当前节点请求 {r?.exitTarget ?? o.exitTarget}，取较快的响应。
                 </p>
-                {!hasCurrent && <Banner kind="warn">请先在“加速”页选择节点配置。</Banner>}
+                {!hasCurrent && <Banner kind="warn">请先选择节点配置。</Banner>}
                 {c.error && <Banner kind="error">{c.error}</Banner>}
                 <dl className="check">
-                    <dt>当前到游戏服务器 IPv4</dt>
+                    <dt>出口 IPv4</dt>
                     <dd className={r ? (r.exitIP ? 'ok' : 'bad') : ''}>
                         {r ? r.exitIP || '查询失败：' + r.exitIPError : pending}
                     </dd>
-                    <dt>当前到中转服务器延迟</dt>
+                    <dt>入口连接延迟</dt>
                     <dd className={r ? (r.entrance.ok ? 'ok' : 'bad') : ''}>
                         {r ? <>
                             {r.entrance.text}
                             {r.entranceTarget && <span className="target">{r.entranceTarget}　{r.entrance.detail}</span>}
                         </> : pending}
                     </dd>
-                    <dt>当前到游戏服务器延迟</dt>
-                    <dd className={r ? (r.game.ok ? 'ok' : 'bad') : ''}>
+                    <dt>出口 HTTPS 响应延迟</dt>
+                    <dd className={r ? (r.exit.ok ? 'ok' : 'bad') : ''}>
                         {r ? <>
-                            {r.game.text}
-                            <span className="target">{r.gameTarget}　经 {r.transport.toUpperCase()}　{r.game.detail}</span>
+                            {r.exit.text}
+                            <span className="target">经 {r.transport.toUpperCase()}　{r.exit.detail}</span>
                         </> : pending}
                     </dd>
-                    <dt>本机 DNS 解析游戏域名</dt>
-                    <dd className={r ? (r.dns.ok ? 'ok' : 'bad') : ''} title={r ? r.dns.failed.join('\n') : undefined}>
-                        {r ? <>
-                            {r.dns.text}
-                            {r.dns.servers.length > 0 && <span className="target">DNS 服务器 {r.dns.servers.join('、')}</span>}
-                        </> : pending}
+                    <dt>节点 DNS</dt>
+                    <dd className={r ? (r.dnsError ? 'bad' : 'ok') : ''}>
+                        {r ? r.dnsError || '正常' : pending}
                     </dd>
                 </dl>
-                {r && !r.dns.ok && <Banner kind="warn">{r.dns.advice}</Banner>}
             </Card>
         </div>
     )

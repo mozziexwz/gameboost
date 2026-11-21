@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,16 +11,19 @@ import (
 	"time"
 )
 
-// Proxy is a local SOCKS5 endpoint. A non-empty User selects RFC 1929
-// username/password authentication; otherwise no authentication is offered.
+// Proxy is the authenticated loopback SOCKS5 endpoint of the node connection.
 type Proxy struct {
 	Addr     string
 	User     string
 	Password string
+
+	// DialNode opens an authenticated Mieru stream before the loopback SOCKS5
+	// server can synthesize a CONNECT reply in no-wait mode.
+	DialNode func(context.Context) (net.Conn, error)
 }
 
 const (
-	phaseProxy = "proxy" // connecting to the local SOCKS5 listener
+	phaseProxy = "proxy" // connecting to the proxy listener
 	phaseSOCKS = "socks" // SOCKS5 negotiation and CONNECT reply
 )
 
@@ -39,16 +43,33 @@ var errTimeout = errors.New("测速请求超时")
 // proxy side resolves it (socks5h semantics). The returned connection still
 // carries deadline; callers set their own.
 func DialSOCKS5(p Proxy, host string, port int, deadline time.Time) (net.Conn, error) {
+	return DialSOCKS5Context(context.Background(), p, host, port, deadline)
+}
+
+// DialSOCKS5Context also cancels an in-progress proxy handshake.
+func DialSOCKS5Context(ctx context.Context, p Proxy, host string, port int, deadline time.Time) (net.Conn, error) {
 	d := net.Dialer{Deadline: deadline}
-	conn, err := d.Dial("tcp", p.Addr)
+	conn, err := d.DialContext(ctx, "tcp", p.Addr)
 	if err != nil {
 		return nil, &phaseError{phase: phaseProxy, err: err}
 	}
+	return completeSOCKS5(ctx, conn, deadline, func() error {
+		return socks5Connect(conn, p, host, port)
+	})
+}
+
+func completeSOCKS5(ctx context.Context, conn net.Conn, deadline time.Time, handshake func() error) (net.Conn, error) {
 	if err := conn.SetDeadline(deadline); err != nil {
 		conn.Close()
 		return nil, &phaseError{phase: phaseProxy, err: err}
 	}
-	if err := socks5Connect(conn, p, host, port); err != nil {
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	err := handshake()
+	stop()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	if err != nil {
 		conn.Close()
 		return nil, &phaseError{phase: phaseSOCKS, err: err}
 	}
@@ -74,10 +95,10 @@ func socks5Connect(rw io.ReadWriter, p Proxy, host string, port int) error {
 		return errors.New("SOCKS5 协议回复无效")
 	}
 	if method == 0x00 && (greeting[1] == 0x02 || greeting[1] == 0xFF) {
-		return errors.New("本地 SOCKS5 需要认证或不接受无认证连接")
+		return errors.New("SOCKS5 需要认证或不接受无认证连接")
 	}
 	if greeting[1] == 0xFF {
-		return errors.New("本地 SOCKS5 不接受用户名密码认证")
+		return errors.New("SOCKS5 不接受用户名密码认证")
 	}
 	if greeting[1] != method {
 		return errors.New("SOCKS5 认证方式不支持")
@@ -100,10 +121,17 @@ func socks5Connect(rw io.ReadWriter, p Proxy, host string, port int) error {
 			return errors.New("SOCKS5 认证回复无效")
 		}
 		if status[1] != 0 {
-			return errors.New("本地 SOCKS5 认证失败")
+			return errors.New("SOCKS5 认证失败")
 		}
 	}
 
+	return socks5RequestConnect(rw, host, port)
+}
+
+func socks5RequestConnect(rw io.ReadWriter, host string, port int) error {
+	if port < 1 || port > 65535 {
+		return errors.New("测试端口无效")
+	}
 	req := []byte{5, 1, 0}
 	if ip := net.ParseIP(host); ip != nil {
 		if v4 := ip.To4(); v4 != nil {
@@ -151,10 +179,16 @@ func socks5Connect(rw io.ReadWriter, p Proxy, host string, port int) error {
 		return err
 	}
 	if head[1] != 0 {
-		return errors.New(socksReplyReason(head[1]))
+		return connectReplyError(head[1])
 	}
 	return nil
 }
+
+// connectReplyError marks a complete SOCKS5 reply rejecting the connection.
+// Even when the target fails, the reply confirms the proxy was reachable.
+type connectReplyError byte
+
+func (e connectReplyError) Error() string { return socksReplyReason(byte(e)) }
 
 func socksReplyReason(code byte) string {
 	switch code {
@@ -228,6 +262,9 @@ func errnoOf(err error) (syscall.Errno, bool) {
 func failureReason(err error) string {
 	if isTimeout(err) {
 		return "测速请求超时"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "检测已取消"
 	}
 	if e, ok := errnoOf(err); ok {
 		switch {

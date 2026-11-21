@@ -9,11 +9,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mozziexwz/node_launcher/internal/store"
+	"github.com/mozziexwz/gameboost/internal/store"
 )
 
 // writeDiagnostics writes a support bundle: the system summary, settings, a
-// list of node configurations (names and entrances only, never their
+// list of proxy configurations (names and entrances only, never their
 // contents or passwords) and the launcher logs, which are masked already.
 func writeDiagnostics(w io.Writer, layout store.Layout, summary []string) error {
 	zw := zip.NewWriter(w)

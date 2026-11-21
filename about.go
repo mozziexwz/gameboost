@@ -65,7 +65,7 @@ func aboutInfo() AboutDTO {
 	return AboutDTO{
 		Version:   versionString(),
 		Copyright: copyrightNotice,
-		License: "MSBOOST 启动器是自由软件：你可以依据自由软件基金会发布的 GNU 通用公共许可证第 3 版（GPL-3.0）" +
+		License: "GAMEBOOST 是自由软件，你可以依据自由软件基金会发布的 GNU 通用公共许可证第 3 版（GPL-3.0）" +
 			"再发布和修改本程序。本程序不提供任何担保。许可全文和所用的开源组件见“开源许可”。",
 		Components: []ComponentDTO{
 			// Shown by its Japanese name, as the project itself writes it; the

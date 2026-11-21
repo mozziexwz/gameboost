@@ -3,18 +3,18 @@ import {api, Check, errorText, LogLine, Notice, on, Overview, State} from './api
 import {Banner, Confirm, ConfirmRequest, formatBytes, formatUptime, Spinner, Steady, useClock, widestBytes, widestUptime} from './components'
 import {CheckPage, CheckState} from './pages/Check'
 import {Configs} from './pages/Configs'
-import {Game} from './pages/Game'
+import {Rules} from './pages/Rules'
 import {Home} from './pages/Home'
 import {Logs} from './pages/Logs'
 import {Settings} from './pages/Settings'
 
-type Page = 'home' | 'configs' | 'check' | 'game' | 'logs' | 'settings'
+type Page = 'home' | 'configs' | 'check' | 'rules' | 'logs' | 'settings'
 
 const pages: {id: Page, label: string}[] = [
     {id: 'home', label: '加速'},
     {id: 'configs', label: '节点配置'},
-    {id: 'check', label: '网络检测'},
-    {id: 'game', label: '游戏与加速项'},
+    {id: 'check', label: '出口检测'},
+    {id: 'rules', label: '分流规则'},
     {id: 'logs', label: '日志'},
     {id: 'settings', label: '设置与关于'},
 ]
@@ -34,7 +34,7 @@ const statusText: Record<State, string> = {
 }
 
 const maxLogLines = 1000
-const homepage = 'https://msboost.de/'
+const homepage = 'https://github.com/mozziexwz/gameboost'
 
 // mergeLogs adds lines not seen yet, keeping sequence order and a size cap.
 function mergeLogs(old: LogLine[], lines: LogLine[] | null): LogLine[] {
@@ -52,7 +52,7 @@ function StatusBar(props: {overview: Overview | null}) {
     const st = props.overview?.status
     useClock(st?.state === 'running')
     const current = props.overview?.configs.find(c => c.current)
-    const config = (st?.config || current?.name || '').replace(/\.json$/i, '')
+    const config = (current?.name ?? '').replace(/\.json$/i, '')
     let left: ReactNode = <span>正在加载…</span>
     if (st?.state === 'running') {
         left = <>
@@ -82,6 +82,7 @@ export default function App() {
     const [check, setCheck] = useState<Check | null>(null)
     const [checking, setChecking] = useState(false)
     const [checkError, setCheckError] = useState('')
+    const [checkedFor, setCheckedFor] = useState('')
     const lastState = useRef<State | null>(null)
     const noticeId = useRef(0)
     const refreshing = useRef<Promise<void> | null>(null)
@@ -143,10 +144,14 @@ export default function App() {
     const confirm = useCallback((title: string, message: string, confirmLabel: string, danger = false) =>
         new Promise<boolean>(resolve => setConfirmRequest({title, message, confirm: confirmLabel, danger, resolve})), [])
 
-    // The network check lives here so the home summary and the check page
-    // show the same result.
+    const current = overview?.configs.find(c => c.current && !c.error)
+    const checkKey = JSON.stringify([
+        current?.name, current?.entrance,
+        overview?.status.transport || overview?.transport,
+    ])
     const runCheck = useCallback(async () => {
         setChecking(true)
+        setCheckedFor(checkKey)
         setCheckError('')
         setCheck(null)
         try {
@@ -156,8 +161,13 @@ export default function App() {
         } finally {
             setChecking(false)
         }
-    }, [])
-    const checkState: CheckState = {result: check, running: checking, error: checkError, run: runCheck}
+    }, [checkKey])
+    const checkState: CheckState = {
+        result: checkedFor === checkKey ? check : null,
+        running: checking,
+        error: checkedFor === checkKey ? checkError : '',
+        run: runCheck,
+    }
 
     const go = (p: Page) => {
         setPage(p)
@@ -169,7 +179,7 @@ export default function App() {
         switch (page) {
             case 'home':
                 content = <Home overview={overview} refresh={refresh} confirm={confirm} check={checkState}
-                                goConfigs={() => go('configs')} goCheck={() => go('check')}/>
+                                goConfigs={() => go('configs')} goCheck={() => go('check')} goRules={() => go('rules')}/>
                 break
             case 'configs':
                 content = <Configs overview={overview} refresh={refresh} confirm={confirm}/>
@@ -177,8 +187,8 @@ export default function App() {
             case 'check':
                 content = <CheckPage overview={overview} check={checkState}/>
                 break
-            case 'game':
-                content = <Game overview={overview} refresh={refresh}/>
+            case 'rules':
+                content = <Rules overview={overview} refresh={refresh}/>
                 break
             case 'logs':
                 content = <Logs lines={logs}/>
@@ -200,7 +210,7 @@ export default function App() {
                 ))}
                 <div className="tabs-right">
                     <span>{overview?.version}</span>
-                    <button className="link home-link" onClick={() => api.openURL(homepage)}>MSBOOST</button>
+                    <button className="link home-link" onClick={() => api.openURL(homepage)}>GAMEBOOST</button>
                 </div>
             </nav>
 

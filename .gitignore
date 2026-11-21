@@ -22,6 +22,9 @@
 *.lib
 
 # 用户状态、真实配置与日志
+/configs/
+/data/
+/settings.json
 msboost-state.dat
 *.pbprofile
 *.log

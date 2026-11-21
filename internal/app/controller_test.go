@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,12 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mozziexwz/node_launcher/internal/engine"
-	"github.com/mozziexwz/node_launcher/internal/logx"
-	"github.com/mozziexwz/node_launcher/internal/probe"
-	"github.com/mozziexwz/node_launcher/internal/profiles"
-	"github.com/mozziexwz/node_launcher/internal/store"
-	"github.com/mozziexwz/node_launcher/internal/sysproxy"
+	"github.com/mozziexwz/gameboost/internal/doh"
+	"github.com/mozziexwz/gameboost/internal/engine"
+	"github.com/mozziexwz/gameboost/internal/logx"
+	"github.com/mozziexwz/gameboost/internal/probe"
+	"github.com/mozziexwz/gameboost/internal/profiles"
+	"github.com/mozziexwz/gameboost/internal/store"
+	"github.com/mozziexwz/gameboost/internal/sysproxy"
 )
 
 // ---- fakes ----
@@ -33,6 +35,7 @@ type fakeEngine struct {
 
 func (e *fakeEngine) Addr() *net.TCPAddr           { return e.addr }
 func (e *fakeEngine) Credential() (string, string) { return e.user, e.password }
+func (e *fakeEngine) DNSFlows() []doh.Flow         { return nil }
 func (e *fakeEngine) Stats() engine.Stats {
 	return engine.Stats{Accepted: 5, Active: 2, Upload: 3072, Download: 1 << 20, UploadRate: 100, DownloadRate: 2048}
 }
@@ -85,11 +88,15 @@ func (r *fakeRedirector) DeleteProxy(id uint32) bool {
 	return ok
 }
 
-func (r *fakeRedirector) AddProxyRule(processes string, proxyID uint32) (uint32, error) {
+func (r *fakeRedirector) AddProxyRule(processes, hosts string, proxyID uint32) (uint32, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ruleCalls++
-	r.record("add-rule " + processes)
+	if hosts == "*" {
+		r.record("add-rule " + processes)
+	} else {
+		r.record("add-rule " + processes + " -> " + hosts)
+	}
 	if r.ruleCalls == r.failRuleCall {
 		return 0, errors.New("rule rejected")
 	}
@@ -246,10 +253,10 @@ type harness struct {
 	checkLog []string
 	mu       sync.Mutex
 
-	// startedWith is the configuration of every core start; helloErr is
-	// what the UDP start's hello returns.
+	// startedWith records the configuration of each core.
 	startedWith []*engine.Config
-	helloErr    error
+	confirmErr  error
+	exitIPErr   error
 
 	runtimeErr error
 	runtimeLog []string // "lock", then "unlock after <last redirector call>"
@@ -329,6 +336,7 @@ func newHarness(t *testing.T, mutate func(*harness)) *harness {
 	writeConfig(t, h.layout, "直连.json", exampleConfig(t))
 	settings := store.DefaultSettings()
 	settings.CurrentConfig = "直连.json"
+	settings.Processes = profiles.DefaultMapleStory().Processes
 	if err := h.layout.SaveSettings(settings); err != nil {
 		t.Fatal(err)
 	}
@@ -440,11 +448,8 @@ func TestStartStopHappyPath(t *testing.T) {
 	}
 }
 
-func TestStartWithAddonsAndWarnings(t *testing.T) {
+func TestStartReportsWarnings(t *testing.T) {
 	h := newHarness(t, func(h *harness) {
-		s, _ := h.layout.LoadSettings()
-		s.Addons["discord"] = true
-		h.layout.SaveSettings(s)
 		h.sys.conflicts = []Conflict{{Message: "检测到 Netch 正在运行", Blocking: false}}
 		h.sys.running = []string{"MapleStory.exe"}
 	})
@@ -455,12 +460,70 @@ func TestStartWithAddonsAndWarnings(t *testing.T) {
 	if len(warnings) != 2 || !strings.Contains(warnings[0], "Netch") || !strings.Contains(warnings[1], "MapleStory.exe") {
 		t.Fatalf("warnings %v", warnings)
 	}
-	calls, rules, _ := h.red.snapshot()
-	discord, _ := findAddon("discord")
-	if rules != 2 || calls[3] != "add-rule "+discord.ProcessList() {
-		t.Fatalf("calls %v", calls)
+	_, rules, _ := h.red.snapshot()
+	if rules != 1 {
+		t.Fatalf("routes added: %d", rules)
 	}
 	h.c.Stop()
+}
+
+type closeFunc func() error
+
+func (f closeFunc) Close() error { return f() }
+
+func TestIPModeUsesOnlyDestinationsAndKeepsDNSProtection(t *testing.T) {
+	h := newHarness(t, func(h *harness) {
+		h.proxies = func() []sysproxy.Endpoint {
+			t.Fatal("IP mode attempted to redirect unrelated connections to the system proxy")
+			return nil
+		}
+	})
+	if err := h.c.SetMode(store.ModeIP); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.c.Start(); !errors.Is(err, ErrNoTargets) {
+		t.Fatalf("start without IP targets: %v", err)
+	}
+	if err := h.c.SetTargets([]string{"203.0.113.6/24", "2001:db8::1"}); err != nil {
+		t.Fatal(err)
+	}
+	var started, closed bool
+	h.c.deps.StartDNS = func(p probe.Proxy, _ []doh.Flow) (io.Closer, error) {
+		started = p.Addr == "127.0.0.1:40000"
+		return closeFunc(func() error { closed = true; return nil }), nil
+	}
+	if _, err := h.c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.c.Shutdown)
+	h.waitFor(t, "add-rule * -> 203.0.113.0-203.0.113.255;2001:db8::1")
+	if st := h.c.Status(); !started || st.Upload == 0 || st.Download == 0 || len(st.SystemProxy) != 0 {
+		t.Fatalf("invalid session: DNS started=%v, status=%+v", started, st)
+	}
+	if err := h.c.SetMode(store.ModeProcess); !errors.Is(err, ErrRunning) {
+		t.Fatalf("switch mode while active: %v", err)
+	}
+	if err := h.c.Stop(); err != nil || !closed {
+		t.Fatalf("stop: %v, DNS closed=%v", err, closed)
+	}
+	if len(h.c.Settings().Processes) == 0 {
+		t.Fatal("process list lost when switching mode")
+	}
+}
+
+func TestDNSProtectionFailureRollsBack(t *testing.T) {
+	h := newHarness(t, nil)
+	h.c.deps.StartDNS = func(probe.Proxy, []doh.Flow) (io.Closer, error) {
+		return nil, errors.New("DNS handle failed")
+	}
+	if _, err := h.c.Start(); err == nil || !strings.Contains(err.Error(), "DNS handle failed") {
+		t.Fatalf("unsafe start result: %v", err)
+	}
+	calls, rules, proxies := h.red.snapshot()
+	if rules != 0 || proxies != 0 || strings.Contains(strings.Join(calls, "|"), "|start") {
+		t.Fatalf("failed DNS setup left interception active: %v", calls)
+	}
+	h.allEnginesClosed(t)
 }
 
 func TestStartRollsBackEveryStep(t *testing.T) {
@@ -479,19 +542,13 @@ func TestStartRollsBackEveryStep(t *testing.T) {
 			s, _ := h.layout.LoadSettings()
 			s.CurrentConfig = ""
 			h.layout.SaveSettings(s)
-		}, "请先选择节点配置", 0, 0},
+		}, ErrNoConfig.Error(), 0, 0},
 		{"broken config", func(h *harness) {
 			os.WriteFile(filepath.Join(h.layout.Configs, "直连.json"), []byte("{"), 0o644)
-		}, "节点配置", 0, 0},
+		}, "节点配置 JSON 格式无效", 0, 0},
 		{"core fails", func(h *harness) { h.engErr = errors.New("MSBOOST 核心启动失败：boom") }, "核心启动失败", 0, 0},
 		{"proxy config rejected", func(h *harness) { h.red.failSOCKS = true }, "socks5 rejected", 1, 1},
 		{"game rule rejected", func(h *harness) { h.red.failRuleCall = 1 }, "rule rejected", 1, 1},
-		{"addon rule rejected", func(h *harness) {
-			s, _ := h.layout.LoadSettings()
-			s.Addons["steam"] = true
-			h.layout.SaveSettings(s)
-			h.red.failRuleCall = 2
-		}, "rule rejected", 1, 1},
 		{"interception fails", func(h *harness) { h.red.startFails = true }, "分流启动失败", 1, 1},
 	}
 	for _, c := range cases {
@@ -540,51 +597,6 @@ func TestSecretsMaskedOnlyDuringSession(t *testing.T) {
 	h.log.Printf(logx.Core, "after session-pass-0")
 	if text := h.log.Recent(1)[0].Text; !strings.Contains(text, "session-pass-0") {
 		t.Fatalf("old session secrets should be released after stop: %q", text)
-	}
-}
-
-func TestAddonSwitchesLive(t *testing.T) {
-	h := newHarness(t, nil)
-	if _, err := h.c.Start(); err != nil {
-		t.Fatal(err)
-	}
-	discord, _ := findAddon("discord")
-	if err := h.c.SetAddon("discord", true); err != nil {
-		t.Fatal(err)
-	}
-	calls, rules, _ := h.red.snapshot()
-	if calls[len(calls)-1] != "add-rule "+discord.ProcessList() || rules != 2 {
-		t.Fatalf("calls %v", calls)
-	}
-	if err := h.c.SetAddon("discord", true); err != nil {
-		t.Fatal(err)
-	}
-	if _, rules, _ := h.red.snapshot(); rules != 2 {
-		t.Fatal("switching on twice must not add a second rule")
-	}
-	if s, _ := h.layout.LoadSettings(); !s.Addons["discord"] {
-		t.Fatal("the switch must be saved")
-	}
-	if err := h.c.SetAddon("discord", false); err != nil {
-		t.Fatal(err)
-	}
-	calls, rules, _ = h.red.snapshot()
-	if !strings.HasPrefix(calls[len(calls)-1], "delete-rule ") || rules != 1 {
-		t.Fatalf("calls %v rules %d", calls, rules)
-	}
-	if err := h.c.SetAddon("vpn", true); err == nil {
-		t.Fatal("unknown addon accepted")
-	}
-	h.c.Stop()
-	if _, rules, proxies := h.red.snapshot(); rules != 0 || proxies != 0 {
-		t.Fatal("stop must remove addon rules too")
-	}
-	// While idle the switch is only saved.
-	if err := h.c.SetAddon("steam", true); err != nil {
-		t.Fatal(err)
-	}
-	if calls, _, _ := h.red.snapshot(); strings.Contains(calls[len(calls)-1], "steam") {
-		t.Fatal("an idle switch must not touch the redirector")
 	}
 }
 
@@ -681,8 +693,7 @@ type checkMode struct {
 	ipFails       bool
 	dnsReason     string
 	entranceFails bool
-	missingV2     bool
-	gameDNSFails  bool
+	exitFails     bool
 }
 
 var currentCheckMode checkMode
@@ -694,8 +705,12 @@ func (h *harness) fakeChecks() CheckFuncs {
 		h.mu.Unlock()
 	}
 	return CheckFuncs{
+		NodeDNS: func(context.Context, probe.Proxy) error { return nil },
 		ExitIP: func(_ context.Context, p probe.Proxy) (string, error) {
 			note("ip " + p.Addr + " " + p.User)
+			if h.exitIPErr != nil {
+				return "", h.exitIPErr
+			}
 			if currentCheckMode.ipFails {
 				return "", errors.New("mock IP lookup failure")
 			}
@@ -715,28 +730,16 @@ func (h *harness) fakeChecks() CheckFuncs {
 			}
 			return samples(3, 165*time.Millisecond)
 		},
-		FullPath: func(p probe.Proxy, addr string, port int, _ probe.FullPathOptions) probe.Result {
-			note(fmt.Sprintf("full %s:%d via %s as %s", addr, port, p.Addr, p.User))
-			if currentCheckMode.missingV2 {
-				return probe.Unavailable("节点未提供兼容的版本 2 全程 TCP 测速服务或服务不可达")
+		WebLatency: func(_ context.Context, p probe.Proxy, url string) probe.Result {
+			note(fmt.Sprintf("exit %s via %s as %s", url, p.Addr, p.User))
+			if currentCheckMode.exitFails {
+				return probe.Unavailable("目标拒绝连接")
 			}
 			return samples(3, 221250*time.Microsecond)
 		},
-		Hello: func(p probe.Proxy, _ time.Duration) error {
-			note("hello " + p.Addr + " " + p.User)
-			return h.helloErr
-		},
-		// Not noted in checkLog: it runs alongside the others, in no fixed order.
-		GameDNS: func(context.Context) probe.DNSResult {
-			local := probe.DNSAnswer{Addrs: []string{"203.0.113.5"}, Duration: 12 * time.Millisecond}
-			if currentCheckMode.gameDNSFails {
-				local = probe.DNSAnswer{Err: "超时", Duration: probe.DNSTimeout}
-			}
-			return probe.DNSResult{Servers: []string{"192.168.1.1"}, Lookups: []probe.DNSLookup{{
-				DNSQuery: probe.DNSQuery{Host: "us-sso.nexon.io", Purpose: "游戏登录"},
-				Local:    local,
-				Public:   probe.DNSAnswer{Addrs: []string{"203.0.113.5"}, Duration: 7 * time.Millisecond},
-			}}}
+		ConfirmRelay: func(_ context.Context, p probe.Proxy, host string, port int) error {
+			note(fmt.Sprintf("confirm %s:%d via %s", host, port, p.Addr))
+			return h.confirmErr
 		},
 	}
 }
@@ -759,33 +762,35 @@ func runCheck(t *testing.T, mode checkMode, setup func(*harness)) (*harness, Che
 	return h, r
 }
 
-func TestCheckShowsMeasuredFullPathWithoutAddingEntrance(t *testing.T) {
+func TestCheckMeasuresExitWithoutAddingEntrance(t *testing.T) {
 	h, r := runCheck(t, checkMode{}, nil)
 	if r.ExitIP != "198.51.100.9" || r.Entrance.Compact() != "165 ms" || r.EntranceTarget != "192.0.2.10:8964" {
 		t.Fatalf("result %+v", r)
 	}
-	if got := r.Game.Compact(); got != "221 ms" {
-		t.Fatalf("game latency %q: must be the measured full path, never 165 + 221", got)
+	if got := r.Exit.Compact(); got != "221 ms" {
+		t.Fatalf("exit latency %q, want 221 ms", got)
 	}
-	want := "ip 127.0.0.1:40000 session-user-0 | resolve 192.0.2.10 | entrance 192.0.2.10:8964 x3 | full 35.155.204.207:8585 via 127.0.0.1:40000 as session-user-0"
+	want := "ip 127.0.0.1:40000 session-user-0 | resolve 192.0.2.10 | entrance 192.0.2.10:8964 x3 | exit https://ip.sb/ via 127.0.0.1:40000 as session-user-0"
 	if got := h.calls(); got != want {
 		t.Fatalf("calls:\n%s\nwant:\n%s", got, want)
 	}
 	h.allEnginesClosed(t) // the temporary core started for an idle check is closed
 }
 
-func TestCheckUsesConfiguredProbeTarget(t *testing.T) {
+func TestCheckUsesFixedExitTargetWithLegacySettings(t *testing.T) {
 	h, r := runCheck(t, checkMode{}, func(h *harness) {
-		s, _ := h.layout.LoadSettings()
-		s.ProbeTarget = store.ProbeTarget{Address: "51.222.56.192", Port: 8484}
-		h.layout.SaveSettings(s)
+		legacy := []byte(`{"version":3,"currentConfig":"直连.json","probeTarget":{"address":"192.0.2.25","port":8484}}`)
+		if err := os.WriteFile(h.layout.Settings, legacy, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	})
-	if r.GameTarget != "51.222.56.192:8484" || !strings.Contains(h.calls(), "full 51.222.56.192:8484") {
-		t.Fatalf("target %s calls %s", r.GameTarget, h.calls())
+	if r.ExitTarget != "https://ip.sb/" || !strings.Contains(h.calls(), "exit https://ip.sb/ via ") {
+		t.Fatalf("target %s calls %s", r.ExitTarget, h.calls())
 	}
+	h.allEnginesClosed(t)
 }
 
-func TestCheckEntranceProblemsNeverSuppressGame(t *testing.T) {
+func TestCheckEntranceProblemsNeverSuppressExit(t *testing.T) {
 	udpOnly := func(h *harness) {
 		m := exampleConfig(t)
 		server := m["profiles"].([]any)[0].(map[string]any)["servers"].([]any)[0].(map[string]any)
@@ -823,8 +828,8 @@ func TestCheckEntranceProblemsNeverSuppressGame(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			h, r := runCheck(t, c.mode, c.setup)
-			if got := r.Game.Compact(); got != "221 ms" {
-				t.Fatalf("game %q must survive entrance/IP problems", got)
+			if got := r.Exit.Compact(); got != "221 ms" {
+				t.Fatalf("exit %q must survive entrance/IP problems", got)
 			}
 			if strings.Contains(h.calls(), "entrance ") != c.entranceRuns {
 				t.Fatalf("entrance measurement ran=%v; calls %s", !c.entranceRuns, h.calls())
@@ -839,30 +844,10 @@ func TestCheckEntranceProblemsNeverSuppressGame(t *testing.T) {
 	}
 }
 
-func TestCheckReportsGameDNS(t *testing.T) {
-	h, r := runCheck(t, checkMode{}, nil)
-	if !r.DNS.OK() || r.DNS.Compact() != "正常（最慢 12 ms）" {
-		t.Fatalf("dns %+v", r.DNS)
-	}
-	if got := h.log.Recent(1)[0].Text; !strings.HasSuffix(got, "；本机 DNS 正常（最慢 12 ms）") {
-		t.Fatalf("log %q", got)
-	}
-
-	h, r = runCheck(t, checkMode{gameDNSFails: true}, nil)
-	if r.DNS.OK() || r.Game.Compact() != "221 ms" || r.Entrance.Compact() != "165 ms" || r.ExitIP != "198.51.100.9" {
-		t.Fatalf("a DNS failure must show without hiding the other checks: %+v", r)
-	}
-	want := "；本机 DNS 解析失败（1 个中 1 个）：us-sso.nexon.io 超时；公共 DNS 能解析"
-	if got := h.log.Recent(1)[0].Text; !strings.HasSuffix(got, want) {
-		t.Fatalf("log %q lacks %q", got, want)
-	}
-}
-
-func TestCheckMissingV2ServiceIsExplicit(t *testing.T) {
-	_, r := runCheck(t, checkMode{missingV2: true}, nil)
-	game := r.Game.Compact()
-	if !strings.Contains(game, "版本 2") || strings.Contains(game, "ms") {
-		t.Fatalf("game %q must name the v2 requirement without inventing a latency", game)
+func TestCheckReportsExitFailure(t *testing.T) {
+	_, r := runCheck(t, checkMode{exitFails: true}, nil)
+	if got := r.Exit.Compact(); got != "未测得：目标拒绝连接" {
+		t.Fatalf("unexpected exit failure %q", got)
 	}
 	if r.Entrance.Compact() != "165 ms" || r.ExitIP != "198.51.100.9" {
 		t.Fatal("the other two checks stay available")
@@ -878,8 +863,8 @@ func TestCheckIgnoresConfiguredLocalAuthentication(t *testing.T) {
 		m["socks5Authentication"] = []any{map[string]any{"user": "test-only", "password": "test-only"}}
 		writeConfig(t, h.layout, "直连.json", m)
 	})
-	if r.Game.Compact() != "221 ms" || !strings.Contains(h.calls(), "as session-user-0") {
-		t.Fatalf("game %q calls %s", r.Game.Compact(), h.calls())
+	if r.Exit.Compact() != "221 ms" || !strings.Contains(h.calls(), "as session-user-0") {
+		t.Fatalf("exit %q calls %s", r.Exit.Compact(), h.calls())
 	}
 }
 
@@ -944,10 +929,17 @@ func TestSystemProxyTakeover(t *testing.T) {
 		}
 	})
 
+	game := profiles.DefaultMapleStory().ProcessList()
+	if filepath.Separator == '\\' {
+		folder := filepath.Join(t.TempDir(), "Game files")
+		if err := h.c.SetProcessFolders([]string{folder}); err != nil {
+			t.Fatal(err)
+		}
+		game += ";" + filepath.Join(folder, "*")
+	}
 	if _, err := h.c.Start(); err != nil {
 		t.Fatal(err)
 	}
-	game := profiles.DefaultMapleStory().ProcessList()
 	calls, _, _ := h.red.snapshot()
 	// Proxies 1 and 2, then the takeover rule (3) before the game rule (4).
 	if len(calls) != 7 || calls[0] != "prepare" || !strings.HasPrefix(calls[1], "add-socks5 127.0.0.1:40000 ") ||
@@ -971,12 +963,6 @@ func TestSystemProxyTakeover(t *testing.T) {
 	h.waitFor(t, "edit-tcp-rule 3 "+game+" -> 127.0.0.1:7890 via 2")
 	h.waitFor(t, "enable-rule 3")
 	h.waitFor(t, "localhost-ports [7890]")
-
-	// Discord's own requests to the proxy are taken over too.
-	if err := h.c.SetAddon("discord", true); err != nil {
-		t.Fatal(err)
-	}
-	h.waitFor(t, "edit-tcp-rule 3 "+game+";Discord.exe;DiscordPTB.exe;DiscordCanary.exe -> 127.0.0.1:7890 via 2")
 
 	if err := h.c.Stop(); err != nil {
 		t.Fatal(err)
@@ -1069,29 +1055,34 @@ func boundProtocols(cfg *engine.Config) string {
 }
 
 // UDP is used only when chosen and offered. The core never gets both
-// bindings, and a hello proves UDP before the redirector sends anything.
+// bindings, and a confirmed reply proves UDP before the redirector starts.
 func TestStartPicksTheTransport(t *testing.T) {
 	for _, c := range []struct {
 		name      string
 		dual      bool
 		chosen    string
-		helloErr  error
+		checkErr  error
+		ipOK      bool
 		started   string // bindings of each core start
 		transport string
-		hellos    int
+		checks    int
 		fellBack  bool
 	}{
-		{"TCP-only configuration", false, engine.TransportUDP, nil, "TCP", "tcp", 0, false},
-		{"TCP chosen", true, engine.TransportTCP, nil, "TCP", "tcp", 0, false},
-		{"UDP", true, engine.TransportUDP, nil, "UDP", "udp", 1, false},
-		{"UDP falls back to TCP", true, engine.TransportUDP, errors.New("hello timed out"), "UDP TCP", "tcp", 1, true},
+		{"TCP-only configuration", false, engine.TransportUDP, nil, false, "TCP", "tcp", 0, false},
+		{"TCP chosen", true, engine.TransportTCP, nil, false, "TCP", "tcp", 0, false},
+		{"UDP", true, engine.TransportUDP, nil, false, "UDP", "udp", 1, false},
+		{"UDP confirmed by exit IP", true, engine.TransportUDP, context.DeadlineExceeded, true, "UDP", "udp", 1, false},
+		{"UDP falls back to TCP", true, engine.TransportUDP, context.DeadlineExceeded, false, "UDP TCP", "tcp", 1, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			h := newHarness(t, func(h *harness) {
 				if c.dual {
 					writeConfig(t, h.layout, "直连.json", dualConfig(t))
 				}
-				h.helloErr = c.helloErr
+				h.confirmErr = c.checkErr
+				if !c.ipOK {
+					h.exitIPErr = context.DeadlineExceeded
+				}
 			})
 			if err := h.c.SetTransport(c.chosen); err != nil {
 				t.Fatal(err)
@@ -1110,8 +1101,11 @@ func TestStartPicksTheTransport(t *testing.T) {
 			if st := h.c.Status(); st.Transport != c.transport {
 				t.Fatalf("status transport %q, want %q", st.Transport, c.transport)
 			}
-			if got := strings.Count(h.calls(), "hello "); got != c.hellos {
-				t.Fatalf("%d hellos, want %d", got, c.hellos)
+			if got := strings.Count(h.calls(), "confirm ip.sb:443 via 127.0.0.1:40000"); got != c.checks {
+				t.Fatalf("UDP preflight calls %s, want %d checks", h.calls(), c.checks)
+			}
+			if triedIP := strings.Contains(h.calls(), "ip 127.0.0.1:40000"); triedIP != (c.checkErr != nil) {
+				t.Fatalf("UDP preflight calls %s, exit IP check=%v", h.calls(), triedIP)
 			}
 			if fellBack := len(warnings) == 1 && strings.Contains(warnings[0], "改用 TCP"); fellBack != c.fellBack || (!c.fellBack && len(warnings) != 0) {
 				t.Fatalf("warnings %v", warnings)
@@ -1165,20 +1159,18 @@ func TestCheckRunsOnTheChosenTransport(t *testing.T) {
 	if r.Transport != engine.TransportUDP || len(h.startedWith) != 1 || boundProtocols(h.startedWith[0]) != "UDP" {
 		t.Fatalf("check transport %q, core on %v", r.Transport, h.startedWith)
 	}
-	if r.EntranceTarget != "192.0.2.10:8964" || strings.Contains(h.calls(), "hello ") {
+	if r.EntranceTarget != "192.0.2.10:8964" || strings.Contains(h.calls(), "confirm ") {
 		t.Fatalf("entrance %q, calls %s", r.EntranceTarget, h.calls())
 	}
 	h.allEnginesClosed(t)
 }
 
-// Seen on a real node whose UDP was dropped: the exit IP and the game check
-// time out through the tunnel while the entrance answers TCP. Over UDP that
-// is UDP being dropped; over TCP the original reasons stand.
-func TestCheckBlamesUDPWhenOnlyTCPAnswers(t *testing.T) {
+// A responding TCP entrance cannot determine why the UDP exit failed.
+func TestCheckKeepsIndependentExitFailures(t *testing.T) {
 	dual := func(h *harness) { writeConfig(t, h.layout, "直连.json", dualConfig(t)) }
 	for _, transport := range []string{engine.TransportUDP, engine.TransportTCP} {
 		t.Run(transport, func(t *testing.T) {
-			currentCheckMode = checkMode{ipFails: true, missingV2: true}
+			currentCheckMode = checkMode{ipFails: true, exitFails: true}
 			t.Cleanup(func() { currentCheckMode = checkMode{} })
 			h := newHarness(t, dual)
 			if err := h.c.SetTransport(transport); err != nil {
@@ -1188,20 +1180,9 @@ func TestCheckBlamesUDPWhenOnlyTCPAnswers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			blamed := r.ExitIPError == udpBlocked && r.Game.Compact() == "未测得："+udpBlocked
-			if blamed != (transport == engine.TransportUDP) || r.Entrance.SuccessCount == 0 {
-				t.Fatalf("%s: exit IP %q, game %q", transport, r.ExitIPError, r.Game.Compact())
+			if r.ExitIPError != "mock IP lookup failure" || r.Exit.Compact() != "未测得：目标拒绝连接" || r.Entrance.SuccessCount == 0 {
+				t.Fatalf("%s: exit IP %q, latency %q", transport, r.ExitIPError, r.Exit.Compact())
 			}
 		})
-	}
-	// A node that is down altogether keeps the original reasons over UDP too.
-	currentCheckMode = checkMode{ipFails: true, missingV2: true, entranceFails: true}
-	t.Cleanup(func() { currentCheckMode = checkMode{} })
-	h := newHarness(t, dual)
-	if err := h.c.SetTransport(engine.TransportUDP); err != nil {
-		t.Fatal(err)
-	}
-	if r, err := h.c.Check(context.Background()); err != nil || r.ExitIPError == udpBlocked {
-		t.Fatalf("down node blamed on UDP: %v %q", err, r.ExitIPError)
 	}
 }
