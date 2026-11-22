@@ -35,10 +35,13 @@ import (
 )
 
 const (
-	e2eHit      = "127.0.0.219:54681"
-	e2eMiss     = "127.0.1.219:54681"
-	e2eOutbound = "192.0.2.54:54681"
-	e2eIPv6     = "[::1]:54681"
+	e2eHit  = "127.0.0.219:54681"
+	e2eMiss = "127.0.1.219:54681"
+	e2eIPv6 = "[::1]:54681"
+
+	// A destination ending in .255 outside the local subnet must still be proxied.
+	e2eOutboundIP = "192.0.2.255"
+	e2eOutbound   = e2eOutboundIP + ":54681"
 )
 
 // TestWindowsRoutingE2E uses real child processes, the signed WinDivert
@@ -117,7 +120,7 @@ func TestWindowsRoutingE2E(t *testing.T) {
 	if err := ctl.SetProcesses([]string{selected}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.SetTargets([]string{"127.0.0.0/24", "192.0.2.54", "::1"}); err != nil {
+	if err := ctl.SetTargets([]string{"127.0.0.0/24", e2eOutboundIP, "::1"}); err != nil {
 		t.Fatal(err)
 	}
 	for _, mode := range []store.RouteMode{store.ModeProcess, store.ModeIP} {

@@ -1,0 +1,63 @@
+--- a/ProxyBridge.c
++++ b/ProxyBridge.c
+@@ -663,5 +663,5 @@
+ 
+                     // Override PROXY to DIRECT for critical IPs and ports
+-                    if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(dest_ip))
++                    if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(dest_ip, src_ip, addr.Network.IfIdx))
+                         action = RULE_ACTION_DIRECT;
+ 
+@@ -920,5 +920,5 @@
+ 
+                 // Override PROXY to DIRECT for criticl ips
+-                if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(orig_dest_ip))
++                if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(orig_dest_ip, src_ip, addr.Network.IfIdx))
+                     action = RULE_ACTION_DIRECT;
+ 
+--- a/pb_internal.h
++++ b/pb_internal.h
+@@ -293,5 +293,5 @@
+ BOOL rule_has_domain_filter(const PROCESS_RULE *rule);
+ BOOL match_domain_filter(const PROCESS_RULE *rule, const char *domain);
+-BOOL is_broadcast_or_multicast(UINT32 ip);
++BOOL is_broadcast_or_multicast(UINT32 ip, UINT32 src_ip, UINT32 interface_index);
+ RuleAction match_rule_inner(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id);
+ RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id);
+--- a/pb_rules.c
++++ b/pb_rules.c
+@@ -504,5 +504,5 @@
+ }
+ 
+-BOOL is_broadcast_or_multicast(UINT32 ip)
++BOOL is_broadcast_or_multicast(UINT32 ip, UINT32 src_ip, UINT32 interface_index)
+ {
+     // note: Localhost (127.x.x.x) is now supported for proxying
+@@ -520,12 +520,23 @@
+         return TRUE;
+ 
+-    // x.x.x.255
+-    if ((ip & 0xFF000000) == 0xFF000000)
+-        return TRUE;
+-
+     // Multicast: 224.0.0.0 - 239.255.255.255 (first octet 224-239)
+     if (first_octet >= 224 && first_octet <= 239)
+         return TRUE;
+ 
+-    return FALSE;
++    // A directed broadcast uses the sender's on-link prefix. All eligible
++    // prefixes leave at least two host bits; /31 and /32 have no broadcast.
++    const UINT32 dst = ntohl(ip);
++    if ((dst & 3) != 3 || interface_index == 0)
++        return FALSE;
++
++    MIB_UNICASTIPADDRESS_ROW source = {0};
++    source.Address.Ipv4.sin_family = AF_INET;
++    source.Address.Ipv4.sin_addr.s_addr = src_ip;
++    source.InterfaceIndex = interface_index;
++    if (GetUnicastIpAddressEntry(&source) != NO_ERROR ||
++        source.OnLinkPrefixLength == 0 || source.OnLinkPrefixLength >= 31)
++        return FALSE;
++
++    const UINT32 host_bits = (1u << (32 - source.OnLinkPrefixLength)) - 1u;
++    return dst == (ntohl(src_ip) | host_bits);
+ }
